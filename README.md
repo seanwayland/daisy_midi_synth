@@ -1,7 +1,8 @@
 
-
-
-# /Users/seanwayland/Desktop/daisy_synth/DaisyExamples/pod/Midi
+# head to this directory
+```
+/Users/seanwayland/Desktop/daisy_synth/DaisyExamples/pod/Midi
+```
 
 # Daisy Synth MIDI Example
 
