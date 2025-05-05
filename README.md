@@ -3,6 +3,7 @@
 ```
 /Users/seanwayland/Desktop/daisy_synth/DaisyExamples/pod/Midi
 ```
+1. edit /Users/seanwayland/Desktop/daisy_synth/DaisyExamples/pod/Midi/Midi.cpp
 
 # Daisy Synth MIDI Example
 
