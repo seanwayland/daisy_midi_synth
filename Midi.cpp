@@ -30,10 +30,10 @@ struct Voice {
         filt.SetRes(resonance);
 
         env.Init(samplerate);
-        env.SetTime(ADSR_SEG_ATTACK, 0.01f);
+        env.SetTime(ADSR_SEG_ATTACK, 0.03f);
         env.SetTime(ADSR_SEG_DECAY, 0.2f);
         env.SetSustainLevel(0.7f);
-        env.SetTime(ADSR_SEG_RELEASE, 0.1f);
+        env.SetTime(ADSR_SEG_RELEASE, 0.03f);
     }
 
     void NoteOn(int n, float velocity) {
@@ -134,7 +134,7 @@ void HandleMidiMessage(MidiEvent m) {
                     UpdateFilters();
                     break;
                 case 2:
-                    globalResonance = static_cast<float>(p.value) / 127.0f;
+                    globalResonance = static_cast<float>(p.value) / 400.0f;
                     UpdateFilters();
                     break;
             }
