@@ -8,6 +8,7 @@ using namespace daisysp;
 DaisyPod hw;
 
 constexpr size_t kMaxVoices = 8;
+constexpr size_t kVoicesPerSide = kMaxVoices / 2;
 constexpr float kPitchBendRange = 7.0f;  // +/- 7 semitones pitch bend range
 
 struct Voice {
@@ -20,14 +21,13 @@ struct Voice {
     float      resonance = 0.1f;
     bool       gate = false;
 
-    // Current pitch bend in semitones applied to this voice
     float pitch_bend_semitones = 0.0f;
 
     void Init(float samplerate) {
         osc.Init(samplerate);
         osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
         osc.SetAmp(1.0f);
-        osc.SetPw(0.9f);
+        osc.SetPw(0.9f);  // default, can be overridden later
 
         filt.Init(samplerate);
         filt.SetFreq(cutoff);
@@ -72,6 +72,10 @@ struct Voice {
         }
     }
 
+    void SetPulseWidth(float pw) {
+        osc.SetPw(pw);
+    }
+
     float Process() {
         if(!active) return 0.0f;
 
@@ -87,54 +91,86 @@ struct Voice {
     }
 };
 
-std::vector<Voice> voices(kMaxVoices);
+// Create two sets of voices for left and right
+std::vector<Voice> voices_left(kVoicesPerSide);
+std::vector<Voice> voices_right(kVoicesPerSide);
 
-float globalCutoff = 1000.0f;
+float globalCutoffLeft = 1020.0f;
+float globalCutoffRight = 1000.0f;
 float globalResonance = 0.1f;
 float globalPitchBend = 0.0f;
 
+// Update filters for all voices
 void UpdateFilters() {
-    for(auto& voice : voices) {
-        voice.SetFilter(globalCutoff, globalResonance);
+    for(auto& v : voices_left) {
+        v.SetFilter(globalCutoffLeft, globalResonance);
+    }
+    for(auto& v : voices_right) {
+        v.SetFilter(globalCutoffRight, globalResonance);
     }
 }
 
 void UpdatePitchBend(float semitones) {
     globalPitchBend = semitones;
-    for(auto& voice : voices) {
-        voice.SetPitchBend(semitones);
+    for(auto& v : voices_left) {
+        v.SetPitchBend(semitones);
     }
+    for(auto& v : voices_right) {
+        v.SetPitchBend(semitones);
+    }
+}
+
+// Helper to find an available voice in a vector
+Voice* FindFreeVoice(std::vector<Voice>& voices) {
+    for(auto& v : voices) {
+        if(!v.active)
+            return &v;
+    }
+    return &voices[0];  // voice steal if all active
 }
 
 void AudioCallback(AudioHandle::InterleavingInputBuffer in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t size) {
     for(size_t i = 0; i < size; i += 2) {
-        float sig = 0.0f;
-        for(auto& voice : voices) {
-            sig += voice.Process();
+        float sig_left = 0.0f;
+        float sig_right = 0.0f;
+
+        for(auto& v : voices_left) {
+            sig_left += v.Process();
         }
-        sig /= static_cast<float>(kMaxVoices);
-        out[i] = out[i + 1] = sig;
+        for(auto& v : voices_right) {
+            sig_right += v.Process();
+        }
+
+        sig_left /= static_cast<float>(kVoicesPerSide);
+        sig_right /= static_cast<float>(kVoicesPerSide);
+
+        out[i] = sig_left;       // left channel
+        out[i + 1] = sig_right;  // right channel
     }
 }
 
 void HandleNoteOn(uint8_t note, uint8_t velocity) {
-    for(auto& voice : voices) {
-        if(!voice.active) {
-            voice.NoteOn(note, velocity);
-            voice.SetPitchBend(globalPitchBend);
-            return;
-        }
+    // Trigger all voices on both sides simultaneously
+    {
+        Voice* voice = FindFreeVoice(voices_left);
+        voice->NoteOn(note, velocity);
+        voice->SetPitchBend(globalPitchBend);
     }
-    // Voice stealing
-    voices[0].NoteOn(note, velocity);
-    voices[0].SetPitchBend(globalPitchBend);
+    {
+        Voice* voice = FindFreeVoice(voices_right);
+        voice->NoteOn(note, velocity);
+        voice->SetPitchBend(globalPitchBend);
+    }
 }
 
 void HandleNoteOff(uint8_t note) {
-    for(auto& voice : voices) {
-        voice.NoteOff(note);
+    for(auto& v : voices_left) {
+        v.NoteOff(note);
+    }
+    for(auto& v : voices_right) {
+        v.NoteOff(note);
     }
 }
 
@@ -157,7 +193,8 @@ void HandleMidiMessage(MidiEvent m) {
             auto p = m.AsControlChange();
             switch(p.control_number) {
                 case 1:
-                    globalCutoff = mtof(static_cast<float>(p.value));
+                    globalCutoffLeft = mtof(static_cast<float>(p.value)) + 10.0f;  // +10 for left side offset (1010)
+                    globalCutoffRight = mtof(static_cast<float>(p.value));          // default right side cutoff
                     UpdateFilters();
                     break;
                 case 2:
@@ -170,8 +207,7 @@ void HandleMidiMessage(MidiEvent m) {
         case PitchBend: {
             auto p = m.AsPitchBend();
             float bendVal = static_cast<float>(p.value);
-            //float norm = (bendVal - 8192.0f) / 8192.0f; // Normalize [-1,1]
-            float norm = (bendVal  / 8192.0f); // Normalize [-1,1]
+            float norm = (bendVal / 8192.0f); // corrected normalization [-1,1]
             float semitones = norm * kPitchBendRange;
             UpdatePitchBend(semitones);
             break;
@@ -185,9 +221,15 @@ int main(void) {
     hw.SetAudioBlockSize(4);
     float samplerate = hw.AudioSampleRate();
 
-    for(auto& voice : voices) {
-        voice.Init(samplerate);
-        voice.SetFilter(globalCutoff, globalResonance);
+    for(auto& v : voices_left) {
+        v.Init(samplerate);
+        v.SetFilter(globalCutoffLeft, globalResonance);
+        v.SetPulseWidth(0.87f);  // Slightly narrower pulse width on left
+    }
+    for(auto& v : voices_right) {
+        v.Init(samplerate);
+        v.SetFilter(globalCutoffRight, globalResonance);
+        v.SetPulseWidth(0.9f);   // Default pulse width on right
     }
 
     hw.StartAdc();
