@@ -12,33 +12,40 @@ constexpr size_t kMaxVoices = 8;
 struct Voice {
     Oscillator osc;
     Svf        filt;
+    Adsr       env;
     bool       active = false;
     int        note = -1;
     float      cutoff = 1000.0f;
     float      resonance = 0.1f;
+    bool       gate = false;
 
     void Init(float samplerate) {
         osc.Init(samplerate);
         osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
-        osc.SetPw(0.85f);
-        osc.SetAmp(0.8f);
+        osc.SetAmp(1.0f);
+        osc.SetPw(0.9f);
 
         filt.Init(samplerate);
-        filt.SetRes(resonance);
         filt.SetFreq(cutoff);
+        filt.SetRes(resonance);
+
+        env.Init(samplerate);
+        env.SetTime(ADSR_SEG_ATTACK, 0.01f);
+        env.SetTime(ADSR_SEG_DECAY, 0.2f);
+        env.SetSustainLevel(0.7f);
+        env.SetTime(ADSR_SEG_RELEASE, 0.1f);
     }
 
     void NoteOn(int n, float velocity) {
         note = n;
-        osc.SetFreq(mtof(n));
-        osc.SetAmp(velocity / 127.0f);
         active = true;
+        gate = true;
+        osc.SetFreq(mtof(static_cast<float>(n)));
     }
 
     void NoteOff(int n) {
         if(note == n) {
-            active = false;
-            osc.SetAmp(0.0f);
+            gate = false;
         }
     }
 
@@ -51,7 +58,14 @@ struct Voice {
 
     float Process() {
         if(!active) return 0.0f;
-        float sig = osc.Process();
+
+        float amp = env.Process(gate);
+        if(amp <= 0.0001f && !gate) {
+            active = false;
+            return 0.0f;
+        }
+
+        float sig = osc.Process() * amp;
         filt.Process(sig);
         return filt.Low();
     }
@@ -59,7 +73,6 @@ struct Voice {
 
 std::vector<Voice> voices(kMaxVoices);
 
-// Shared filter settings (controlled via MIDI CC)
 float globalCutoff = 1000.0f;
 float globalResonance = 0.1f;
 
@@ -72,13 +85,12 @@ void UpdateFilters() {
 void AudioCallback(AudioHandle::InterleavingInputBuffer in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t size) {
-    float sig;
     for(size_t i = 0; i < size; i += 2) {
-        sig = 0.0f;
+        float sig = 0.0f;
         for(auto& voice : voices) {
             sig += voice.Process();
         }
-        sig /= kMaxVoices;  // prevent clipping
+        sig /= static_cast<float>(kMaxVoices);
         out[i] = out[i + 1] = sig;
     }
 }
@@ -90,8 +102,7 @@ void HandleNoteOn(uint8_t note, uint8_t velocity) {
             return;
         }
     }
-    // Voice stealing
-    voices[0].NoteOn(note, velocity);
+    voices[0].NoteOn(note, velocity); // voice stealing
 }
 
 void HandleNoteOff(uint8_t note) {
@@ -103,7 +114,7 @@ void HandleNoteOff(uint8_t note) {
 void HandleMidiMessage(MidiEvent m) {
     switch(m.type) {
         case NoteOn: {
-            NoteOnEvent p = m.AsNoteOn();
+            auto p = m.AsNoteOn();
             if(p.velocity != 0)
                 HandleNoteOn(p.note, p.velocity);
             else
@@ -111,19 +122,19 @@ void HandleMidiMessage(MidiEvent m) {
             break;
         }
         case NoteOff: {
-            NoteOffEvent p = m.AsNoteOff();
+            auto p = m.AsNoteOff();
             HandleNoteOff(p.note);
             break;
         }
         case ControlChange: {
-            ControlChangeEvent p = m.AsControlChange();
+            auto p = m.AsControlChange();
             switch(p.control_number) {
-                case 1: // Cutoff
-                    globalCutoff = mtof((float)p.value);
+                case 1:
+                    globalCutoff = mtof(static_cast<float>(p.value));
                     UpdateFilters();
                     break;
-                case 2: // Resonance
-                    globalResonance = (float)p.value / 127.0f;
+                case 2:
+                    globalResonance = static_cast<float>(p.value) / 127.0f;
                     UpdateFilters();
                     break;
             }
@@ -134,13 +145,10 @@ void HandleMidiMessage(MidiEvent m) {
 }
 
 int main(void) {
-    float samplerate;
     hw.Init();
     hw.SetAudioBlockSize(4);
-    hw.seed.usb_handle.Init(UsbHandle::FS_INTERNAL);
-    System::Delay(250);
+    float samplerate = hw.AudioSampleRate();
 
-    samplerate = hw.AudioSampleRate();
     for(auto& voice : voices) {
         voice.Init(samplerate);
         voice.SetFilter(globalCutoff, globalResonance);
@@ -150,7 +158,7 @@ int main(void) {
     hw.StartAudio(AudioCallback);
     hw.midi.StartReceive();
 
-    for(;;) {
+    while(true) {
         hw.midi.Listen();
         while(hw.midi.HasEvents()) {
             HandleMidiMessage(hw.midi.PopEvent());
