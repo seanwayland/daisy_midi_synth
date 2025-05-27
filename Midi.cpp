@@ -8,19 +8,20 @@ using namespace daisysp;
 DaisyPod hw;
 
 constexpr size_t kMaxVoices = 8;
+constexpr float kPitchBendRange = 7.0f;  // +/- 7 semitones pitch bend range
 
 struct Voice {
     Oscillator osc;
     Svf        filt;
     Adsr       env;
-    Adsr       filterEnv;
-
     bool       active = false;
     int        note = -1;
     float      cutoff = 1000.0f;
     float      resonance = 0.1f;
     bool       gate = false;
-    float      filterEnvAmt = 1000.0f; // Filter envelope modulation amount in Hz
+
+    // Current pitch bend in semitones applied to this voice
+    float pitch_bend_semitones = 0.0f;
 
     void Init(float samplerate) {
         osc.Init(samplerate);
@@ -37,19 +38,13 @@ struct Voice {
         env.SetTime(ADSR_SEG_DECAY, 0.2f);
         env.SetSustainLevel(0.7f);
         env.SetTime(ADSR_SEG_RELEASE, 0.03f);
-
-        filterEnv.Init(samplerate);
-        filterEnv.SetTime(ADSR_SEG_ATTACK, 0.01f);
-        filterEnv.SetTime(ADSR_SEG_DECAY, 0.1f);
-        filterEnv.SetSustainLevel(0.0f);
-        filterEnv.SetTime(ADSR_SEG_RELEASE, 0.1f);
     }
 
     void NoteOn(int n, float velocity) {
         note = n;
         active = true;
         gate = true;
-        osc.SetFreq(mtof(static_cast<float>(n)));
+        UpdateFrequency();
     }
 
     void NoteOff(int n) {
@@ -61,22 +56,30 @@ struct Voice {
     void SetFilter(float cutoffHz, float res) {
         cutoff = cutoffHz;
         resonance = res;
+        filt.SetFreq(cutoff);
         filt.SetRes(resonance);
+    }
+
+    void SetPitchBend(float semitones) {
+        pitch_bend_semitones = semitones;
+        UpdateFrequency();
+    }
+
+    void UpdateFrequency() {
+        if(note >= 0) {
+            float freq = mtof(static_cast<float>(note) + pitch_bend_semitones);
+            osc.SetFreq(freq);
+        }
     }
 
     float Process() {
         if(!active) return 0.0f;
 
         float amp = env.Process(gate);
-        float filtEnvVal = filterEnv.Process(gate);
-
         if(amp <= 0.0001f && !gate) {
             active = false;
             return 0.0f;
         }
-
-        float envCutoff = cutoff + (filtEnvVal * filterEnvAmt);
-        filt.SetFreq(envCutoff);
 
         float sig = osc.Process() * amp;
         filt.Process(sig);
@@ -88,10 +91,18 @@ std::vector<Voice> voices(kMaxVoices);
 
 float globalCutoff = 1000.0f;
 float globalResonance = 0.1f;
+float globalPitchBend = 0.0f;
 
 void UpdateFilters() {
     for(auto& voice : voices) {
         voice.SetFilter(globalCutoff, globalResonance);
+    }
+}
+
+void UpdatePitchBend(float semitones) {
+    globalPitchBend = semitones;
+    for(auto& voice : voices) {
+        voice.SetPitchBend(semitones);
     }
 }
 
@@ -112,10 +123,13 @@ void HandleNoteOn(uint8_t note, uint8_t velocity) {
     for(auto& voice : voices) {
         if(!voice.active) {
             voice.NoteOn(note, velocity);
+            voice.SetPitchBend(globalPitchBend);
             return;
         }
     }
-    voices[0].NoteOn(note, velocity); // voice stealing
+    // Voice stealing
+    voices[0].NoteOn(note, velocity);
+    voices[0].SetPitchBend(globalPitchBend);
 }
 
 void HandleNoteOff(uint8_t note) {
@@ -150,12 +164,16 @@ void HandleMidiMessage(MidiEvent m) {
                     globalResonance = static_cast<float>(p.value) / 400.0f;
                     UpdateFilters();
                     break;
-                case 3:
-                    for(auto& voice : voices) {
-                        voice.filterEnvAmt = (static_cast<float>(p.value) / 127.0f) * 8000.0f;
-                    }
-                    break;
             }
+            break;
+        }
+        case PitchBend: {
+            auto p = m.AsPitchBend();
+            float bendVal = static_cast<float>(p.value);
+            //float norm = (bendVal - 8192.0f) / 8192.0f; // Normalize [-1,1]
+            float norm = (bendVal  / 8192.0f); // Normalize [-1,1]
+            float semitones = norm * kPitchBendRange;
+            UpdatePitchBend(semitones);
             break;
         }
         default: break;
