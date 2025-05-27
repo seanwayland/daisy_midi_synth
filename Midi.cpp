@@ -13,11 +13,14 @@ struct Voice {
     Oscillator osc;
     Svf        filt;
     Adsr       env;
+    Adsr       filterEnv;
+
     bool       active = false;
     int        note = -1;
     float      cutoff = 1000.0f;
     float      resonance = 0.1f;
     bool       gate = false;
+    float      filterEnvAmt = 1000.0f; // Filter envelope modulation amount in Hz
 
     void Init(float samplerate) {
         osc.Init(samplerate);
@@ -34,6 +37,12 @@ struct Voice {
         env.SetTime(ADSR_SEG_DECAY, 0.2f);
         env.SetSustainLevel(0.7f);
         env.SetTime(ADSR_SEG_RELEASE, 0.03f);
+
+        filterEnv.Init(samplerate);
+        filterEnv.SetTime(ADSR_SEG_ATTACK, 0.01f);
+        filterEnv.SetTime(ADSR_SEG_DECAY, 0.1f);
+        filterEnv.SetSustainLevel(0.0f);
+        filterEnv.SetTime(ADSR_SEG_RELEASE, 0.1f);
     }
 
     void NoteOn(int n, float velocity) {
@@ -52,7 +61,6 @@ struct Voice {
     void SetFilter(float cutoffHz, float res) {
         cutoff = cutoffHz;
         resonance = res;
-        filt.SetFreq(cutoff);
         filt.SetRes(resonance);
     }
 
@@ -60,10 +68,15 @@ struct Voice {
         if(!active) return 0.0f;
 
         float amp = env.Process(gate);
+        float filtEnvVal = filterEnv.Process(gate);
+
         if(amp <= 0.0001f && !gate) {
             active = false;
             return 0.0f;
         }
+
+        float envCutoff = cutoff + (filtEnvVal * filterEnvAmt);
+        filt.SetFreq(envCutoff);
 
         float sig = osc.Process() * amp;
         filt.Process(sig);
@@ -136,6 +149,11 @@ void HandleMidiMessage(MidiEvent m) {
                 case 2:
                     globalResonance = static_cast<float>(p.value) / 400.0f;
                     UpdateFilters();
+                    break;
+                case 3:
+                    for(auto& voice : voices) {
+                        voice.filterEnvAmt = (static_cast<float>(p.value) / 127.0f) * 8000.0f;
+                    }
                     break;
             }
             break;
