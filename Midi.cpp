@@ -10,6 +10,11 @@ DaisyPod hw;
 constexpr size_t kMaxVoices = 16;
 constexpr size_t kVoicesPerSide = kMaxVoices / 2;
 constexpr float kPitchBendRange = 7.0f;  // +/- 7 semitones pitch bend range
+constexpr float kVelocityCutoffBoost = 800.0f; // Max additional cutoff from velocity
+constexpr float kVelocityPwModAmount = 0.005f; // How much velocity affects pulse width
+constexpr float kBasePwLeft = 0.82f; // Base pulse width for left channel
+constexpr float kBasePwRight = 0.86f; // Base pulse width for right channel
+constexpr float kPwKeyTrackingAmount = 0.0005f; // How much keyboard position affects PW
 
 struct Voice {
     Oscillator osc;
@@ -17,37 +22,52 @@ struct Voice {
     Adsr       env;
     bool       active = false;
     int        note = -1;
-    float      cutoff = 1000.0f;
+    float      base_cutoff = 1000.0f; // Base cutoff without velocity
     float      resonance = 0.1f;
     bool       gate = false;
 
     float pitch_bend_semitones = 0.0f;
     float velocity_amp = 1.0f;
-    //float velocity_cutoff_boost = 0.0f; // <-- affects brightness
+    float velocity_cutoff_boost = 0.0f; // Velocity-based cutoff modulation
+    float current_pw = 0.5f; // Current pulse width
 
     void Init(float samplerate) {
         osc.Init(samplerate);
         osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
         osc.SetAmp(1.0f);
-        osc.SetPw(0.9f);
+        osc.SetPw(0.5f); // Will be set properly in NoteOn
 
         filt.Init(samplerate);
-        filt.SetFreq(cutoff);
+        filt.SetFreq(base_cutoff);
         filt.SetRes(resonance);
 
         env.Init(samplerate);
-        env.SetTime(ADSR_SEG_ATTACK, 0.02f);
+        env.SetTime(ADSR_SEG_ATTACK, 0.03f);
         env.SetTime(ADSR_SEG_DECAY, 0.2f);
-        env.SetSustainLevel(0.7f);
-        env.SetTime(ADSR_SEG_RELEASE, 0.01f);
+        env.SetSustainLevel(0.8f);
+        env.SetTime(ADSR_SEG_RELEASE, 0.015f);
     }
 
-    void NoteOn(int n, float velocity) {
+    void NoteOn(int n, float velocity, bool is_left) {
         note = n;
         active = true;
         gate = true;
         velocity_amp = velocity / 127.0f;
-        //velocity_cutoff_boost = velocity_amp * 400.0f; // <-- subtle boost to cutoff
+        velocity_cutoff_boost = velocity_amp * kVelocityCutoffBoost;
+        
+        // Calculate pulse width based on:
+        // 1. Base value (different per channel)
+        // 2. Keyboard position (lower notes have slightly wider pulse)
+        // 3. Velocity (higher velocity slightly narrows pulse)
+        float base_pw = is_left ? kBasePwLeft : kBasePwRight;
+        float key_tracking = (127.0f - n) * kPwKeyTrackingAmount; // Lower notes = higher PW
+        float vel_mod = (1.0f - velocity_amp) * kVelocityPwModAmount; // Higher velocity = lower PW
+        
+        current_pw = base_pw + key_tracking + vel_mod;
+        current_pw = fclamp(current_pw, 0.01f, 0.99f); // Keep within safe bounds
+        osc.SetPw(current_pw);
+        
+        UpdateFilter(); // Update filter with new velocity modulation
         UpdateFrequency();
     }
 
@@ -58,9 +78,15 @@ struct Voice {
     }
 
     void SetFilter(float cutoffHz, float res) {
-        cutoff = cutoffHz;
+        base_cutoff = cutoffHz; // Store base cutoff
         resonance = res;
-        filt.SetFreq(cutoff);
+        UpdateFilter(); // Update with current velocity modulation
+    }
+
+    void UpdateFilter() {
+        // Apply velocity modulation to the base cutoff
+        float modulated_cutoff = base_cutoff + velocity_cutoff_boost;
+        filt.SetFreq(fclamp(modulated_cutoff, 20.0f, 20000.0f));
         filt.SetRes(resonance);
     }
 
@@ -74,10 +100,6 @@ struct Voice {
             float freq = mtof(static_cast<float>(note) + pitch_bend_semitones);
             osc.SetFreq(freq);
         }
-    }
-
-    void SetPulseWidth(float pw) {
-        osc.SetPw(pw);
     }
 
     float Process() {
@@ -155,12 +177,12 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 void HandleNoteOn(uint8_t note, uint8_t velocity) {
     {
         Voice* voice = FindFreeVoice(voices_left);
-        voice->NoteOn(note, velocity);
+        voice->NoteOn(note, velocity, true); // true for left channel
         voice->SetPitchBend(globalPitchBend);
     }
     {
         Voice* voice = FindFreeVoice(voices_right);
-        voice->NoteOn(note, velocity);
+        voice->NoteOn(note, velocity, false); // false for right channel
         voice->SetPitchBend(globalPitchBend);
     }
 }
@@ -193,7 +215,7 @@ void HandleMidiMessage(MidiEvent m) {
             auto p = m.AsControlChange();
             switch(p.control_number) {
                 case 1:
-                    globalCutoffLeft = mtof(static_cast<float>(p.value)) + 10.0f;
+                    globalCutoffLeft = mtof(static_cast<float>(p.value)) + 20.0f;
                     globalCutoffRight = mtof(static_cast<float>(p.value));
                     UpdateFilters();
                     break;
@@ -224,12 +246,10 @@ int main(void) {
     for(auto& v : voices_left) {
         v.Init(samplerate);
         v.SetFilter(globalCutoffLeft, globalResonance);
-        v.SetPulseWidth(0.87f);
     }
     for(auto& v : voices_right) {
         v.Init(samplerate);
         v.SetFilter(globalCutoffRight, globalResonance);
-        v.SetPulseWidth(0.9f);
     }
 
     hw.StartAdc();
