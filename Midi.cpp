@@ -22,6 +22,7 @@ constexpr float kVelocityPwModAmount = 0.005f;
 constexpr float kBasePwLeft = 0.82f;
 constexpr float kBasePwRight = 0.86f;
 constexpr float kPwKeyTrackingAmount = 0.0005f;
+constexpr float kNoteFilterTrackingAmount = 10.0f; // Added constant for note-based filter tracking
 
 DaisyPod hw;
 
@@ -52,7 +53,7 @@ struct Voice {
         filt.SetRes(resonance);
 
         env.Init(samplerate);
-        env.SetTime(ADSR_SEG_ATTACK, 0.03f);
+        env.SetTime(ADSR_SEG_ATTACK, 0.04f);
         env.SetTime(ADSR_SEG_DECAY, 0.2f);
         env.SetSustainLevel(0.8f);
         env.SetTime(ADSR_SEG_RELEASE, 0.015f);
@@ -89,23 +90,25 @@ struct Voice {
         UpdateFilter();
     }
 
-void SetShape(int shape) {
-    switch(shape) {
-        case 1: 
-            osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); 
-            break;
-        case 2: 
-            osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW); 
-            break;
-        // Add more waveform cases as needed
-        default:
-            osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); // Default case
-            break;
+    void SetShape(int shape) {
+        switch(shape) {
+            case 1: 
+                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); 
+                break;
+            case 2: 
+                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW); 
+                break;
+            // Add more waveform cases as needed
+            default:
+                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); // Default case
+                break;
+        }
     }
-}
 
     void UpdateFilter() {
-        float modulated_cutoff = base_cutoff + velocity_cutoff_boost;
+        // Add note-based filter tracking - higher notes will have slightly brighter filter
+        float note_tracking = (127.0f - note) * kNoteFilterTrackingAmount;
+        float modulated_cutoff = base_cutoff + velocity_cutoff_boost - note_tracking;
         filt.SetFreq(fclamp(modulated_cutoff, 20.0f, 20000.0f));
         filt.SetRes(resonance);
     }
