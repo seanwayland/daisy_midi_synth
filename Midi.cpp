@@ -17,8 +17,8 @@ using namespace daisysp;
 constexpr size_t kMaxVoices = 16;
 constexpr size_t kVoicesPerSide = kMaxVoices / 2;
 constexpr float kPitchBendRange = 7.0f;
-constexpr float kVelocityCutoffBoost = 1200.0f;
-constexpr float kVelocityPwModAmount = 0.01f;
+constexpr float kVelocityCutoffBoost = 1000.0f;
+constexpr float kVelocityPwModAmount = 0.05f;
 constexpr float kBasePwLeft = 0.82f;
 constexpr float kBasePwRight = 0.86f;
 constexpr float kPwKeyTrackingAmount = 0.0005f;
@@ -28,35 +28,45 @@ DaisyPod hw;
 
 // Synth Voice Structure
 struct Voice {
-    Oscillator osc;
-    Svf        filt;
-    Adsr       env;
+    Oscillator osc[2]; // Two oscillators
+    Svf        filt[2]; // Two filters
+    Adsr       env[2]; // Two envelopes
     bool       active = false;
     int        note = -1;
-    float      base_cutoff = 1000.0f;
-    float      resonance = 0.1f;
+    float      base_cutoff = 3000.0f;
+    float      resonance = 0.01f;
     bool       gate = false;
 
     float pitch_bend_semitones = 0.0f;
     float velocity_amp = 1.0f;
-    float velocity_cutoff_boost = 0.0f;
-    float current_pw = 0.5f;
+    float velocity_cutoff_boost = 0.8f;
+    float current_pw[2] = {0.85f, 0.86f}; // Two pulse widths
 
     void Init(float samplerate) {
-        osc.Init(samplerate);
-        osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
-        osc.SetAmp(1.0f);
-        osc.SetPw(0.5f);
+        for (int i = 0; i < 2; i++) {
+            osc[i].Init(samplerate);
+            osc[i].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
+            osc[i].SetAmp(0.5f); // Each oscillator at half amplitude
+            osc[i].SetPw(0.5f);
 
-        filt.Init(samplerate);
-        filt.SetFreq(base_cutoff);
-        filt.SetRes(resonance);
+            filt[i].Init(samplerate);
+            filt[0].SetFreq(base_cutoff);
+            filt[0].SetRes(resonance);
+            filt[1].SetFreq(base_cutoff+3000.0f);
+            filt[1].SetRes(resonance);
 
-        env.Init(samplerate);
-        env.SetTime(ADSR_SEG_ATTACK, 0.04f);
-        env.SetTime(ADSR_SEG_DECAY, 0.2f);
-        env.SetSustainLevel(0.8f);
-        env.SetTime(ADSR_SEG_RELEASE, 0.015f);
+            env[0].Init(samplerate);
+            env[0].SetTime(ADSR_SEG_ATTACK, 0.04f);
+            env[0].SetTime(ADSR_SEG_DECAY, 4.0f);
+            env[0].SetSustainLevel(0.7f);
+            env[0].SetTime(ADSR_SEG_RELEASE, 0.015f);
+
+            env[1].Init(samplerate);
+            env[1].SetTime(ADSR_SEG_ATTACK, 0.04f);
+            env[1].SetTime(ADSR_SEG_DECAY, 1.5f);
+            env[1].SetSustainLevel(0.2f);
+            env[1].SetTime(ADSR_SEG_RELEASE, 0.015f);
+        }
     }
 
     void NoteOn(int n, float velocity, bool is_left) {
@@ -70,9 +80,12 @@ struct Voice {
         float key_tracking = (127.0f - n) * kPwKeyTrackingAmount;
         float vel_mod = (1.0f - velocity_amp) * kVelocityPwModAmount;
         
-        current_pw = base_pw + key_tracking + vel_mod;
-        current_pw = fclamp(current_pw, 0.01f, 0.99f);
-        osc.SetPw(current_pw);
+        // Set slightly different pulse widths for the two oscillators
+        current_pw[0] = fclamp(base_pw + key_tracking + vel_mod, 0.01f, 0.99f);
+        current_pw[1] = fclamp(base_pw + key_tracking * 0.8f + vel_mod * 1.2f, 0.01f, 0.99f);
+        
+        osc[0].SetPw(current_pw[0]);
+        osc[1].SetPw(current_pw[1]);
         
         UpdateFilter();
         UpdateFrequency();
@@ -93,14 +106,17 @@ struct Voice {
     void SetShape(int shape) {
         switch(shape) {
             case 1: 
-                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); 
+                osc[0].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); 
+                osc[1].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
                 break;
             case 2: 
-                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW); 
+                osc[0].SetWaveform(Oscillator::WAVE_POLYBLEP_SAW); 
+                osc[1].SetWaveform(Oscillator::WAVE_POLYBLEP_SAW);
                 break;
             // Add more waveform cases as needed
             default:
-                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); // Default case
+                osc[0].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
+                osc[1].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
                 break;
         }
     }
@@ -109,8 +125,13 @@ struct Voice {
         // Add note-based filter tracking - higher notes will have slightly brighter filter
         float note_tracking = (127.0f - note) * kNoteFilterTrackingAmount;
         float modulated_cutoff = base_cutoff + velocity_cutoff_boost - note_tracking;
-        filt.SetFreq(fclamp(modulated_cutoff, 20.0f, 20000.0f));
-        filt.SetRes(resonance);
+        
+        // Set slightly different cutoff frequencies for the two filters
+        filt[0].SetFreq(fclamp(modulated_cutoff, 20.0f, 20000.0f));
+        filt[1].SetFreq(fclamp(modulated_cutoff * 0.9f, 20.0f, 20000.0f));
+        
+        filt[0].SetRes(resonance);
+        filt[1].SetRes(resonance * 1.1f);
     }
 
     void SetPitchBend(float semitones) {
@@ -121,22 +142,41 @@ struct Voice {
     void UpdateFrequency() {
         if(note >= 0) {
             float freq = mtof(static_cast<float>(note) + pitch_bend_semitones);
-            osc.SetFreq(freq);
+            osc[0].SetFreq(freq);
+            // Slightly detune the second oscillator
+            osc[1].SetFreq(freq * 1.005f);
         }
     }
 
     float Process() {
         if(!active) return 0.0f;
 
-        float amp = env.Process(gate);
-        if(amp <= 0.0001f && !gate) {
+        float amp[2];
+        amp[0] = env[0].Process(gate);
+        amp[1] = env[1].Process(gate);
+        
+        if(amp[0] <= 0.0001f && amp[1] <= 0.0001f && !gate) {
             active = false;
             return 0.0f;
         }
         
-        float sig = osc.Process() * amp * velocity_amp;
-        filt.Process(sig);
-        return filt.Low();
+        // Process both oscillators and filters
+        float sig = 0.0f;
+        // for (int i = 0; i < 2; i++) {
+        //     sig += osc[i].Process() * amp[i] * velocity_amp;
+        //     filt[i].Process(sig);
+        //     sig = filt[i].Low();
+        // }
+        float osc0 = osc[0].Process() * amp[0] * velocity_amp;
+        filt[0].Process(osc0);
+        float sig0 = filt[0].Low();
+        float osc1 = osc[1].Process() * amp[1] * velocity_amp;
+        filt[1].Process(osc1);
+        float sig1 = filt[1].Low();
+        sig = sig0 + sig1;
+
+        
+        return sig;
     }
 };
 
@@ -155,7 +195,7 @@ std::vector<Voice> voices_right(kVoicesPerSide);
 
 float globalCutoffLeft = 1020.0f;
 float globalCutoffRight = 1000.0f;
-float globalResonance = 0.1f;
+float globalResonance = 0.4f;
 float globalPitchBend = 0.0f;
 
 int mode = CHRDEL;
@@ -238,8 +278,8 @@ void HandleMidiMessage(MidiEvent m) {
                     UpdateFilters();
                     break;
                 case 2:
-                    globalResonance = static_cast<float>(p.value) / 400.0f;
-                    UpdateFilters();
+                    //globalResonance = static_cast<float>(p.value) / 400.0f;
+                    //UpdateFilters();
                     break;
             }
             break;
@@ -482,7 +522,7 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 int main(void) {
     // Initialize hardware
     hw.Init();
-    hw.SetAudioBlockSize(4);
+    hw.SetAudioBlockSize(128);
     float samplerate = hw.AudioSampleRate();
 
     // Initialize synth voices
