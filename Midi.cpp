@@ -23,31 +23,48 @@ constexpr float kBasePwLeft = 0.82f;
 constexpr float kBasePwRight = 0.86f;
 constexpr float kPwKeyTrackingAmount = 0.0009f;
 constexpr float kNoteFilterTrackingAmount = 10.0f;
-constexpr float kFilterEnvAmount = 2000.0f; // Maximum filter envelope modulation amount
+constexpr float kFilterEnvAmount = 2000.0f;
+
+// LFO Parameters
+constexpr float kLFOMinRate = 0.1f;    // Minimum LFO rate in Hz
+constexpr float kLFOMaxRate = 10.0f;   // Maximum LFO rate in Hz
+constexpr float kLFOMinDepth = 0.0f;   // Minimum pitch modulation depth (semitones)
+constexpr float kLFOMaxDepth = 0.5f;   // Maximum pitch modulation depth (semitones)
 
 DaisyPod hw;
 
 // Global filter envelope amount controlled by mod wheel
 float globalFilterEnvAmount = 0.0f;
 
+// LFO controls
+float lfoLeftRate = 0.4f;    // Default LFO rate for left channel (Hz)
+float lfoLeftDepth = 0.1f;   // Default LFO depth for left channel (semitones)
+float lfoRightRate = 0.3f;   // Default LFO rate for right channel (Hz)
+float lfoRightDepth = 0.08f;  // Default LFO depth for right channel (semitones)
+
+// LFO objects
+Oscillator lfoLeft, lfoRight;
+
 // Synth Voice Structure
 struct Voice {
     Oscillator osc;
     Svf        filt;
     Adsr       env;
-    Adsr       filter_env; // Added filter envelope
+    Adsr       filter_env;
     bool       active = false;
     int        note = -1;
     float      base_cutoff = 1000.0f;
     float      resonance = 0.1f;
     bool       gate = false;
-    static constexpr int kControlRateDivider = 4; // Update filter every 8 samples
+    static constexpr int kControlRateDivider = 8;
     int control_counter = 0;
 
     float pitch_bend_semitones = 0.0f;
     float velocity_amp = 1.0f;
     float velocity_cutoff_boost = 0.0f;
     float current_pw = 0.5f;
+    float current_freq = 0.0f;
+    bool  is_left = false; // Track which side this voice belongs to
 
     void Init(float samplerate) {
         osc.Init(samplerate);
@@ -61,27 +78,28 @@ struct Voice {
 
         // Initialize amplitude envelope
         env.Init(samplerate);
-        env.SetTime(ADSR_SEG_ATTACK, 0.03f);
+        env.SetTime(ADSR_SEG_ATTACK, 0.04f);
         env.SetTime(ADSR_SEG_DECAY, 0.9f);
         env.SetSustainLevel(0.9f);
         env.SetTime(ADSR_SEG_RELEASE, 0.015f);
 
         // Initialize filter envelope
         filter_env.Init(samplerate);
-        filter_env.SetTime(ADSR_SEG_ATTACK, 0.009f);   // Fast attack
-        filter_env.SetTime(ADSR_SEG_DECAY, 0.09f);     // Medium decay
-        filter_env.SetSustainLevel(0.01f);             // Low sustain
-        filter_env.SetTime(ADSR_SEG_RELEASE, 0.5f);   // Medium release
+        filter_env.SetTime(ADSR_SEG_ATTACK, 0.009f);
+        filter_env.SetTime(ADSR_SEG_DECAY, 0.03f);
+        filter_env.SetSustainLevel(0.01f);
+        filter_env.SetTime(ADSR_SEG_RELEASE, 0.5f);
     }
 
-    void NoteOn(int n, float velocity, bool is_left) {
+    void NoteOn(int n, float velocity, bool left) {
         note = n;
         active = true;
         gate = true;
+        is_left = left;
         velocity_amp = velocity / 127.0f;
         velocity_cutoff_boost = velocity_amp * kVelocityCutoffBoost;
         
-        float base_pw = is_left ? kBasePwLeft : kBasePwRight;
+        float base_pw = left ? kBasePwLeft : kBasePwRight;
         float key_tracking = (127.0f - n) * kPwKeyTrackingAmount;
         float vel_mod = (1.0f - velocity_amp) * kVelocityPwModAmount;
         
@@ -113,23 +131,16 @@ struct Voice {
             case 2: 
                 osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW); 
                 break;
-            // Add more waveform cases as needed
             default:
-                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); // Default case
+                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
                 break;
         }
     }
 
     void UpdateFilter() {
-        // Process filter envelope
         float filter_env_val = filter_env.Process(gate);
-        
-        // Add note-based filter tracking - higher notes will have slightly brighter filter
         float note_tracking = (127.0f - note) * kNoteFilterTrackingAmount;
-        
-        // Calculate filter envelope modulation
         float env_modulation = filter_env_val * globalFilterEnvAmount * kFilterEnvAmount;
-        
         float modulated_cutoff = base_cutoff + velocity_cutoff_boost - note_tracking + 0.35*env_modulation;
         filt.SetFreq(fclamp(modulated_cutoff, 20.0f, 20000.0f));
         filt.SetRes(resonance);
@@ -142,9 +153,16 @@ struct Voice {
 
     void UpdateFrequency() {
         if(note >= 0) {
-            float freq = mtof(static_cast<float>(note) + pitch_bend_semitones);
-            osc.SetFreq(freq);
+            current_freq = mtof(static_cast<float>(note) + pitch_bend_semitones);
+            osc.SetFreq(current_freq);
         }
+    }
+
+    void ApplyLFOModulation() {
+        float lfoValue = is_left ? lfoLeft.Process() : lfoRight.Process();
+        float lfoDepth = is_left ? lfoLeftDepth : lfoRightDepth;
+        float modulated_freq = current_freq * powf(2.0f, lfoValue * lfoDepth / 12.0f);
+        osc.SetFreq(modulated_freq);
     }
 
     float Process() {
@@ -156,11 +174,14 @@ struct Voice {
             return 0.0f;
         }
         
-        // Update filter with envelope modulation on every sample
         if(++control_counter >= kControlRateDivider) {
-        control_counter = 0;
-        UpdateFilter();
+            control_counter = 0;
+            UpdateFilter();
+            ApplyLFOModulation();
         }
+        
+        // Apply LFO modulation every sample
+        
         
         float sig = osc.Process() * amp * velocity_amp;
         filt.Process(sig);
@@ -270,11 +291,6 @@ void HandleMidiMessage(MidiEvent m) {
                     // globalResonance = static_cast<float>(p.value) / 400.0f;
                     // UpdateFilters();
                     break;
-                // case 74: // Filter cutoff (typically CC 74)
-                //     globalCutoffLeft = mtof(static_cast<float>(p.value)) + 20.0f;
-                //     globalCutoffRight = mtof(static_cast<float>(p.value));
-                //     UpdateFilters();
-                //     break;
             }
             break;
         }
@@ -516,8 +532,18 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 int main(void) {
     // Initialize hardware
     hw.Init();
-    hw.SetAudioBlockSize(256);
+    hw.SetAudioBlockSize(512);
     float samplerate = hw.AudioSampleRate();
+
+    // Initialize LFOs
+    lfoLeft.Init(samplerate);
+    lfoRight.Init(samplerate);
+    lfoLeft.SetWaveform(Oscillator::WAVE_SIN);
+    lfoRight.SetWaveform(Oscillator::WAVE_SIN);
+    lfoLeft.SetFreq(lfoLeftRate);
+    lfoRight.SetFreq(lfoRightRate);
+    lfoLeft.SetAmp(1.0f);
+    lfoRight.SetAmp(1.0f);
 
     // Initialize synth voices
     for(auto& v : voices_left) {
@@ -578,5 +604,10 @@ int main(void) {
         while(hw.midi.HasEvents()) {
             HandleMidiMessage(hw.midi.PopEvent());
         }
+        
+        // Update LFO rates based on some control (you can map these to knobs or MIDI CCs)
+        // For now they're fixed at their default values
+        lfoLeft.SetFreq(lfoLeftRate);
+        lfoRight.SetFreq(lfoRightRate);
     }
 }
