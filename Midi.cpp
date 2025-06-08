@@ -18,24 +18,31 @@ constexpr size_t kMaxVoices = 16;
 constexpr size_t kVoicesPerSide = kMaxVoices / 2;
 constexpr float kPitchBendRange = 7.0f;
 constexpr float kVelocityCutoffBoost = 1200.0f;
-constexpr float kVelocityPwModAmount = 0.01f;
+constexpr float kVelocityPwModAmount = 0.05f;
 constexpr float kBasePwLeft = 0.82f;
 constexpr float kBasePwRight = 0.86f;
-constexpr float kPwKeyTrackingAmount = 0.0005f;
-constexpr float kNoteFilterTrackingAmount = 10.0f; // Added constant for note-based filter tracking
+constexpr float kPwKeyTrackingAmount = 0.0009f;
+constexpr float kNoteFilterTrackingAmount = 10.0f;
+constexpr float kFilterEnvAmount = 2000.0f; // Maximum filter envelope modulation amount
 
 DaisyPod hw;
+
+// Global filter envelope amount controlled by mod wheel
+float globalFilterEnvAmount = 0.0f;
 
 // Synth Voice Structure
 struct Voice {
     Oscillator osc;
     Svf        filt;
     Adsr       env;
+    Adsr       filter_env; // Added filter envelope
     bool       active = false;
     int        note = -1;
     float      base_cutoff = 1000.0f;
     float      resonance = 0.1f;
     bool       gate = false;
+    static constexpr int kControlRateDivider = 4; // Update filter every 8 samples
+    int control_counter = 0;
 
     float pitch_bend_semitones = 0.0f;
     float velocity_amp = 1.0f;
@@ -52,11 +59,19 @@ struct Voice {
         filt.SetFreq(base_cutoff);
         filt.SetRes(resonance);
 
+        // Initialize amplitude envelope
         env.Init(samplerate);
-        env.SetTime(ADSR_SEG_ATTACK, 0.04f);
-        env.SetTime(ADSR_SEG_DECAY, 0.2f);
-        env.SetSustainLevel(0.8f);
+        env.SetTime(ADSR_SEG_ATTACK, 0.03f);
+        env.SetTime(ADSR_SEG_DECAY, 0.9f);
+        env.SetSustainLevel(0.9f);
         env.SetTime(ADSR_SEG_RELEASE, 0.015f);
+
+        // Initialize filter envelope
+        filter_env.Init(samplerate);
+        filter_env.SetTime(ADSR_SEG_ATTACK, 0.009f);   // Fast attack
+        filter_env.SetTime(ADSR_SEG_DECAY, 0.09f);     // Medium decay
+        filter_env.SetSustainLevel(0.01f);             // Low sustain
+        filter_env.SetTime(ADSR_SEG_RELEASE, 0.5f);   // Medium release
     }
 
     void NoteOn(int n, float velocity, bool is_left) {
@@ -106,9 +121,16 @@ struct Voice {
     }
 
     void UpdateFilter() {
+        // Process filter envelope
+        float filter_env_val = filter_env.Process(gate);
+        
         // Add note-based filter tracking - higher notes will have slightly brighter filter
         float note_tracking = (127.0f - note) * kNoteFilterTrackingAmount;
-        float modulated_cutoff = base_cutoff + velocity_cutoff_boost - note_tracking;
+        
+        // Calculate filter envelope modulation
+        float env_modulation = filter_env_val * globalFilterEnvAmount * kFilterEnvAmount;
+        
+        float modulated_cutoff = base_cutoff + velocity_cutoff_boost - note_tracking + 0.35*env_modulation;
         filt.SetFreq(fclamp(modulated_cutoff, 20.0f, 20000.0f));
         filt.SetRes(resonance);
     }
@@ -132,6 +154,12 @@ struct Voice {
         if(amp <= 0.0001f && !gate) {
             active = false;
             return 0.0f;
+        }
+        
+        // Update filter with envelope modulation on every sample
+        if(++control_counter >= kControlRateDivider) {
+        control_counter = 0;
+        UpdateFilter();
         }
         
         float sig = osc.Process() * amp * velocity_amp;
@@ -232,15 +260,21 @@ void HandleMidiMessage(MidiEvent m) {
         case ControlChange: {
             auto p = m.AsControlChange();
             switch(p.control_number) {
-                case 1:
+                case 1: // Mod wheel - now controls filter envelope amount
+                    globalFilterEnvAmount = 2.0*(static_cast<float>(p.value) / 127.0f);
                     globalCutoffLeft = mtof(static_cast<float>(p.value)) + 20.0f;
                     globalCutoffRight = mtof(static_cast<float>(p.value));
                     UpdateFilters();
                     break;
                 case 2:
-                    globalResonance = static_cast<float>(p.value) / 400.0f;
-                    UpdateFilters();
+                    // globalResonance = static_cast<float>(p.value) / 400.0f;
+                    // UpdateFilters();
                     break;
+                // case 74: // Filter cutoff (typically CC 74)
+                //     globalCutoffLeft = mtof(static_cast<float>(p.value)) + 20.0f;
+                //     globalCutoffRight = mtof(static_cast<float>(p.value));
+                //     UpdateFilters();
+                //     break;
             }
             break;
         }
@@ -348,7 +382,7 @@ void UpdateKnobs(float &k1, float &k2) {
     }
             drywet = k1;
             delayTarget = hw.knob1.Process() * MAX_DELAY;
-            feedback = k1*0.2f + k2*0.1f; 
+            feedback = k1*0.2f; 
             crs.SetLfoDepth(4.0f + k1*1.1f);
             crs2.SetLfoDepth(5.0f + k1*1.2f);
             crs3.SetLfoDepth(6.0f + k1*0.9f);
@@ -383,7 +417,7 @@ void UpdateKnobs(float &k1, float &k2) {
     }
             drywet = k1;
             delayTarget = hw.knob1.Process() * MAX_DELAY;
-            feedback = k1*0.2f + k2*0.1f; 
+            feedback = k1*0.2f ; 
             crs.SetLfoDepth(4.0f + k1*1.1f);
             crs2.SetLfoDepth(5.0f + k1*1.2f);
             crs3.SetLfoDepth(6.0f + k1*0.9f);
@@ -397,14 +431,14 @@ void UpdateKnobs(float &k1, float &k2) {
         case OCT:
                 // Initialize synth voices
     for(auto& v : voices_left) {
-        v.SetShape(2);
+        v.SetShape(1);
     }
     for(auto& v : voices_right) {
         v.SetShape(2);
     }
             drywet = k1;
             delayTarget = hw.knob1.Process() * MAX_DELAY;
-            feedback = k1*0.2f + k2*0.1f; 
+            feedback = k1*0.2f ; 
             crs.SetLfoDepth(4.0f + k1*1.1f);
             crs2.SetLfoDepth(5.0f + k1*1.2f);
             crs3.SetLfoDepth(6.0f + k1*0.9f);
@@ -482,7 +516,7 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 int main(void) {
     // Initialize hardware
     hw.Init();
-    hw.SetAudioBlockSize(4);
+    hw.SetAudioBlockSize(256);
     float samplerate = hw.AudioSampleRate();
 
     // Initialize synth voices
