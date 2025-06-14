@@ -1,613 +1,319 @@
 #include "daisy_pod.h"
 #include "daisysp.h"
-#include <vector>
+#include <stdio.h>
+#include <string.h>
 
 using namespace daisy;
 using namespace daisysp;
 
-// Effects Constants
-#define MAX_DELAY static_cast<size_t>(48000 * 2.5f)
-#define CHRDEL 0
-#define DEL 1
-#define COR 2
-#define PHR 3
-#define OCT 4
-
-// Synth Constants
-constexpr size_t kMaxVoices = 16;
-constexpr size_t kVoicesPerSide = kMaxVoices / 2;
-constexpr float kPitchBendRange = 7.0f;
-constexpr float kVelocityCutoffBoost = 1200.0f;
-constexpr float kVelocityPwModAmount = 0.05f;
-constexpr float kBasePwLeft = 0.82f;
-constexpr float kBasePwRight = 0.86f;
-constexpr float kPwKeyTrackingAmount = 0.0009f;
-constexpr float kNoteFilterTrackingAmount = 10.0f;
-constexpr float kFilterEnvAmount = 2000.0f;
-
-// LFO Parameters
-constexpr float kLFOMinRate = 0.1f;    // Minimum LFO rate in Hz
-constexpr float kLFOMaxRate = 10.0f;   // Maximum LFO rate in Hz
-constexpr float kLFOMinDepth = 0.0f;   // Minimum pitch modulation depth (semitones)
-constexpr float kLFOMaxDepth = 0.5f;   // Maximum pitch modulation depth (semitones)
-
 DaisyPod hw;
 
-// Global filter envelope amount controlled by mod wheel
-float globalFilterEnvAmount = 0.0f;
+const int kNumVoices = 8;
 
-// LFO controls
-float lfoLeftRate = 0.4f;    // Default LFO rate for left channel (Hz)
-float lfoLeftDepth = 0.1f;   // Default LFO depth for left channel (semitones)
-float lfoRightRate = 0.3f;   // Default LFO rate for right channel (Hz)
-float lfoRightDepth = 0.08f;  // Default LFO depth for right channel (semitones)
-
-// LFO objects
-Oscillator lfoLeft, lfoRight;
-
-// Synth Voice Structure
-struct Voice {
-    Oscillator osc;
-    Svf        filt;
-    Adsr       env;
-    Adsr       filter_env;
-    bool       active = false;
-    int        note = -1;
-    float      base_cutoff = 1000.0f;
-    float      resonance = 0.1f;
-    bool       gate = false;
-    static constexpr int kControlRateDivider = 8;
-    int control_counter = 0;
-
-    float pitch_bend_semitones = 0.0f;
-    float velocity_amp = 1.0f;
-    float velocity_cutoff_boost = 0.0f;
-    float current_pw = 0.5f;
-    float current_freq = 0.0f;
-    bool  is_left = false; // Track which side this voice belongs to
-
-    void Init(float samplerate) {
-        osc.Init(samplerate);
-        osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
-        osc.SetAmp(1.0f);
-        osc.SetPw(0.5f);
-
-        filt.Init(samplerate);
-        filt.SetFreq(base_cutoff);
-        filt.SetRes(resonance);
-
-        // Initialize amplitude envelope
-        env.Init(samplerate);
-        env.SetTime(ADSR_SEG_ATTACK, 0.04f);
-        env.SetTime(ADSR_SEG_DECAY, 0.9f);
-        env.SetSustainLevel(0.9f);
-        env.SetTime(ADSR_SEG_RELEASE, 0.015f);
-
-        // Initialize filter envelope
-        filter_env.Init(samplerate);
-        filter_env.SetTime(ADSR_SEG_ATTACK, 0.009f);
-        filter_env.SetTime(ADSR_SEG_DECAY, 0.03f);
-        filter_env.SetSustainLevel(0.01f);
-        filter_env.SetTime(ADSR_SEG_RELEASE, 0.5f);
+struct FmVoice {
+    Oscillator carrierL, carrierR;
+    Oscillator modulatorL, modulatorR;
+    Adsr env;
+    float carrier_freq;
+    float current_freq;
+    float pitch_bend;
+    float feedback;
+    float mod_index;
+    float base_mod_index;
+    float ratio;
+    bool gate;
+    int note_number;
+    float velocity_amount;
+    
+    float prev_mod_signalL, prev_mod_signalR;
+    float prev_carrier_signalL, prev_carrier_signalR;
+    
+    void Init(float sample_rate) {
+        carrierL.Init(sample_rate);
+        carrierR.Init(sample_rate);
+        modulatorL.Init(sample_rate);
+        modulatorR.Init(sample_rate);
+        env.Init(sample_rate);
+        
+        carrierL.SetWaveform(Oscillator::WAVE_SIN);
+        carrierR.SetWaveform(Oscillator::WAVE_SIN);
+        modulatorL.SetWaveform(Oscillator::WAVE_SIN);
+        modulatorR.SetWaveform(Oscillator::WAVE_SIN);
+        
+        carrier_freq = 440.0f;
+        current_freq = 440.0f;
+        pitch_bend = 0.0f;
+        feedback = 0.0f;
+        mod_index = 1.0f;
+        base_mod_index = 1.0f;
+        ratio = 1.0f;
+        gate = false;
+        note_number = -1;
+        velocity_amount = 1.0f;
+        prev_mod_signalL = prev_mod_signalR = 0.0f;
+        prev_carrier_signalL = prev_carrier_signalR = 0.0f;
+        
+        env.SetAttackTime(0.04f);
+        env.SetDecayTime(0.3f);
+        env.SetReleaseTime(0.03f);
+        env.SetSustainLevel(0.7f);
     }
-
-    void NoteOn(int n, float velocity, bool left) {
-        note = n;
-        active = true;
+    
+    void UpdateFrequencies() {
+        current_freq = carrier_freq * powf(2.0f, pitch_bend / 12.0f);
+        carrierL.SetFreq(current_freq);
+        carrierR.SetFreq(current_freq);
+        modulatorL.SetFreq(current_freq * ratio);
+        modulatorR.SetFreq(current_freq * ratio);
+    }
+    
+    void Process(float* out_left, float* out_right) {
+        if (!gate && env.GetCurrentSegment() == ADSR_SEG_IDLE) {
+            *out_left = 0.0f;
+            *out_right = 0.0f;
+            return;
+        }
+        
+        float note_pos = (float)(note_number - 36) / 60.0f;
+        note_pos = fminf(fmaxf(note_pos, 0.0f), 1.0f);
+        float feedback_scaling = 1.0f - note_pos * 0.7f;
+        float mod_scaling = note_pos * 0.5f + 0.5f;
+        
+        float effective_mod_index = base_mod_index * 
+                                  (0.5f + velocity_amount * 0.5f) *
+                                  mod_scaling;
+        
+        // Left channel (more intense)
+        modulatorL.SetFreq(current_freq * ratio);
+        float mod_signalL = modulatorL.Process() + (prev_mod_signalL * feedback * feedback_scaling * 1.3f);
+        float phase_modL = mod_signalL * effective_mod_index * 0.75f * 0.1f;
+        carrierL.PhaseAdd(phase_modL);
+        float carrier_signalL = carrierL.Process();
+        
+        // Right channel (less intense)
+        modulatorR.SetFreq(current_freq * ratio);
+        float mod_signalR = modulatorR.Process() + (prev_mod_signalR * feedback * feedback_scaling * 0.75f);
+        float phase_modR = mod_signalR * effective_mod_index * 1.2f * 0.1f;
+        carrierR.PhaseAdd(phase_modR);
+        float carrier_signalR = carrierR.Process();
+        
+        float env_val = env.Process(gate);
+        *out_left = carrier_signalL * env_val * velocity_amount;
+        *out_right = carrier_signalR * env_val * velocity_amount;
+        
+        prev_mod_signalL = mod_signalL;
+        prev_mod_signalR = mod_signalR;
+        prev_carrier_signalL = carrier_signalL;
+        prev_carrier_signalR = carrier_signalR;
+    }
+    
+    void SetFreq(float freq) {
+        carrier_freq = freq;
+        UpdateFrequencies();
+    }
+    
+    void SetPitchBend(float bend) {
+        pitch_bend = bend * 7.0f;
+        UpdateFrequencies();
+    }
+    
+    void SetAmp(float amp) {
+        carrierL.SetAmp(amp);
+        carrierR.SetAmp(amp);
+    }
+    
+    void Trigger(float freq, float velocity, int note) {
+        SetFreq(freq);
+        velocity_amount = velocity;
+        SetAmp(velocity * 0.8f);
+        note_number = note;
         gate = true;
-        is_left = left;
-        velocity_amp = velocity / 127.0f;
-        velocity_cutoff_boost = velocity_amp * kVelocityCutoffBoost;
-        
-        float base_pw = left ? kBasePwLeft : kBasePwRight;
-        float key_tracking = (127.0f - n) * kPwKeyTrackingAmount;
-        float vel_mod = (1.0f - velocity_amp) * kVelocityPwModAmount;
-        
-        current_pw = base_pw + key_tracking + vel_mod;
-        current_pw = fclamp(current_pw, 0.01f, 0.99f);
-        osc.SetPw(current_pw);
-        
-        UpdateFilter();
-        UpdateFrequency();
     }
-
-    void NoteOff(int n) {
-        if(note == n) {
-            gate = false;
-        }
+    
+    void Release() {
+        gate = false;
     }
-
-    void SetFilter(float cutoffHz, float res) {
-        base_cutoff = cutoffHz;
-        resonance = res;
-        UpdateFilter();
-    }
-
-    void SetShape(int shape) {
-        switch(shape) {
-            case 1: 
-                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); 
-                break;
-            case 2: 
-                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SAW); 
-                break;
-            default:
-                osc.SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
-                break;
-        }
-    }
-
-    void UpdateFilter() {
-        float filter_env_val = filter_env.Process(gate);
-        float note_tracking = (127.0f - note) * kNoteFilterTrackingAmount;
-        float env_modulation = filter_env_val * globalFilterEnvAmount * kFilterEnvAmount;
-        float modulated_cutoff = base_cutoff + velocity_cutoff_boost - note_tracking + 0.35*env_modulation;
-        filt.SetFreq(fclamp(modulated_cutoff, 20.0f, 20000.0f));
-        filt.SetRes(resonance);
-    }
-
-    void SetPitchBend(float semitones) {
-        pitch_bend_semitones = semitones;
-        UpdateFrequency();
-    }
-
-    void UpdateFrequency() {
-        if(note >= 0) {
-            current_freq = mtof(static_cast<float>(note) + pitch_bend_semitones);
-            osc.SetFreq(current_freq);
-        }
-    }
-
-    void ApplyLFOModulation() {
-        float lfoValue = is_left ? lfoLeft.Process() : lfoRight.Process();
-        float lfoDepth = is_left ? lfoLeftDepth : lfoRightDepth;
-        float modulated_freq = current_freq * powf(2.0f, lfoValue * lfoDepth / 12.0f);
-        osc.SetFreq(modulated_freq);
-    }
-
-    float Process() {
-        if(!active) return 0.0f;
-
-        float amp = env.Process(gate);
-        if(amp <= 0.0001f && !gate) {
-            active = false;
-            return 0.0f;
-        }
-        
-        if(++control_counter >= kControlRateDivider) {
-            control_counter = 0;
-            UpdateFilter();
-            ApplyLFOModulation();
-        }
-        
-        // Apply LFO modulation every sample
-        
-        
-        float sig = osc.Process() * amp * velocity_amp;
-        filt.Process(sig);
-        return filt.Low();
+    
+    bool IsActive() {
+        return gate || env.GetCurrentSegment() != ADSR_SEG_IDLE;
     }
 };
 
-// Effects Objects
-static Chorus crs, crs2, crs3, crs4;
-static PitchShifter pst;
-static Phaser psr, psr2;
-static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS dell;
-static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delr;
-static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS dell2;
-static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delr2;
-
-// Global Variables
-std::vector<Voice> voices_left(kVoicesPerSide);
-std::vector<Voice> voices_right(kVoicesPerSide);
-
-float globalCutoffLeft = 1020.0f;
-float globalCutoffRight = 1000.0f;
-float globalResonance = 0.1f;
-float globalPitchBend = 0.0f;
-
-int mode = CHRDEL;
-int numstages;
-uint32_t octDelSize;
-float currentDelay, feedback, delayTarget, freq, freqtarget, lfotarget, lfo;
-float drywet;
-
-// Helper Functions
-void UpdateFilters() {
-    for(auto& v : voices_left) {
-        v.SetFilter(globalCutoffLeft, globalResonance);
+struct FmSynth {
+    FmVoice voices[kNumVoices];
+    float feedback;
+    float mod_index;
+    float ratio;
+    float pitch_bend;
+    
+    void Init(float sample_rate) {
+        for (int i = 0; i < kNumVoices; i++) {
+            voices[i].Init(sample_rate);
+        }
+        feedback = 0.0f;
+        mod_index = 1.0f;
+        ratio = 1.0f;
+        pitch_bend = 0.0f;
     }
-    for(auto& v : voices_right) {
-        v.SetFilter(globalCutoffRight, globalResonance);
+    
+    void Process(float* out_left, float* out_right, size_t size) {
+        for (size_t i = 0; i < size; i += 2) {
+            float mixL = 0.0f, mixR = 0.0f;
+            for (int v = 0; v < kNumVoices; v++) {
+                float voiceL, voiceR;
+                voices[v].Process(&voiceL, &voiceR);
+                mixL += voiceL * (1.0f / kNumVoices);
+                mixR += voiceR * (1.0f / kNumVoices);
+            }
+            out_left[i] = out_left[i+1] = mixL;
+            out_right[i] = out_right[i+1] = mixR;
+        }
+    }
+    
+    void NoteOn(int note, int velocity) {
+        int voice_idx = -1;
+        for (int i = 0; i < kNumVoices; i++) {
+            if (!voices[i].IsActive()) {
+                voice_idx = i;
+                break;
+            }
+        }
+        
+        if (voice_idx == -1) voice_idx = 0;
+        
+        float normalized_velocity = velocity / 127.0f;
+        voices[voice_idx].Trigger(mtof(note), normalized_velocity, note);
+        voices[voice_idx].feedback = feedback;
+        voices[voice_idx].base_mod_index = mod_index;
+        voices[voice_idx].ratio = ratio;
+        voices[voice_idx].SetPitchBend(pitch_bend);
+    }
+    
+    void NoteOff(int note) {
+        for (int i = 0; i < kNumVoices; i++) {
+            if (voices[i].note_number == note) {
+                voices[i].Release();
+            }
+        }
+    }
+    
+    void SetPitchBend(float bend) {
+        pitch_bend = bend;
+        for (int i = 0; i < kNumVoices; i++) {
+            if (voices[i].IsActive()) {
+                voices[i].SetPitchBend(bend);
+            }
+        }
+    }
+    
+    void SetParam(int cc, float value) {
+        switch(cc) {
+            case 1:
+                mod_index = value * 2.0f;
+                for (int i = 0; i < kNumVoices; i++) {
+                    if (voices[i].IsActive()) {
+                        voices[i].base_mod_index = mod_index;
+                    }
+                }
+                feedback = value;
+                for (int i = 0; i < kNumVoices; i++) {
+                    if (voices[i].IsActive()) {
+                        voices[i].feedback = feedback;
+                    }
+                }
+                break;
+            case 2:
+                feedback = value;
+                for (int i = 0; i < kNumVoices; i++) {
+                    if (voices[i].IsActive()) {
+                        voices[i].feedback = feedback;
+                    }
+                }
+                break;
+            case 3:
+                ratio = 0.25f + value * 3.75f;
+                for (int i = 0; i < kNumVoices; i++) {
+                    if (voices[i].IsActive()) {
+                        voices[i].ratio = ratio;
+                        voices[i].UpdateFrequencies();
+                    }
+                }
+                break;
+            case 4: case 5: case 6: case 7:
+                for (int i = 0; i < kNumVoices; i++) {
+                    if (cc == 4) voices[i].env.SetAttackTime(value * 2.0f);
+                    if (cc == 5) voices[i].env.SetDecayTime(value * 2.0f);
+                    if (cc == 6) voices[i].env.SetSustainLevel(value);
+                    if (cc == 7) voices[i].env.SetReleaseTime(value * 2.0f);
+                }
+                break;
+        }
+    }
+};
+
+FmSynth fm_synth;
+
+void AudioCallback(AudioHandle::InterleavingInputBuffer in,
+                   AudioHandle::InterleavingOutputBuffer out,
+                   size_t size)
+{
+    float out_left[size], out_right[size];
+    fm_synth.Process(out_left, out_right, size);
+    
+    for(size_t i = 0; i < size; i += 2) {
+        out[i] = out_left[i];
+        out[i+1] = out_right[i];
     }
 }
 
-void UpdatePitchBend(float semitones) {
-    globalPitchBend = semitones;
-    for(auto& v : voices_left) {
-        v.SetPitchBend(semitones);
-    }
-    for(auto& v : voices_right) {
-        v.SetPitchBend(semitones);
-    }
-}
-
-Voice* FindFreeVoice(std::vector<Voice>& voices) {
-    for(auto& v : voices) {
-        if(!v.active)
-            return &v;
-    }
-    return &voices[0];
-}
-
-void HandleNoteOn(uint8_t note, uint8_t velocity) {
-    {
-        Voice* voice = FindFreeVoice(voices_left);
-        voice->NoteOn(note, velocity, true);
-        voice->SetPitchBend(globalPitchBend);
-    }
-    {
-        Voice* voice = FindFreeVoice(voices_right);
-        voice->NoteOn(note, velocity, false);
-        voice->SetPitchBend(globalPitchBend);
-    }
-}
-
-void HandleNoteOff(uint8_t note) {
-    for(auto& v : voices_left) {
-        v.NoteOff(note);
-    }
-    for(auto& v : voices_right) {
-        v.NoteOff(note);
-    }
-}
-
-void HandleMidiMessage(MidiEvent m) {
+void HandleMidiMessage(MidiEvent m)
+{
     switch(m.type) {
         case NoteOn: {
-            auto p = m.AsNoteOn();
-            if(p.velocity != 0)
-                HandleNoteOn(p.note, p.velocity);
-            else
-                HandleNoteOff(p.note);
-            break;
-        }
+            NoteOnEvent p = m.AsNoteOn();
+            if(m.data[1] != 0) fm_synth.NoteOn(p.note, p.velocity);
+            else fm_synth.NoteOff(p.note);
+        } break;
+        
         case NoteOff: {
-            auto p = m.AsNoteOff();
-            HandleNoteOff(p.note);
-            break;
-        }
-        case ControlChange: {
-            auto p = m.AsControlChange();
-            switch(p.control_number) {
-                case 1: // Mod wheel - now controls filter envelope amount
-                    globalFilterEnvAmount = 2.0*(static_cast<float>(p.value) / 127.0f);
-                    globalCutoffLeft = mtof(static_cast<float>(p.value)) + 20.0f;
-                    globalCutoffRight = mtof(static_cast<float>(p.value));
-                    UpdateFilters();
-                    break;
-                case 2:
-                    // globalResonance = static_cast<float>(p.value) / 400.0f;
-                    // UpdateFilters();
-                    break;
-            }
-            break;
-        }
+            NoteOffEvent p = m.AsNoteOff();
+            fm_synth.NoteOff(p.note);
+        } break;
+        
         case PitchBend: {
-            auto p = m.AsPitchBend();
-            float bendVal = static_cast<float>(p.value);
-            float norm = (bendVal / 8192.0f);
-            float semitones = norm * kPitchBendRange;
-            UpdatePitchBend(semitones);
-            break;
-        }
+            PitchBendEvent p = m.AsPitchBend();
+            float bend = (float)(p.value / 8192.0f);
+            fm_synth.SetPitchBend(bend);
+        } break;
+        
+        case ControlChange: {
+            ControlChangeEvent p = m.AsControlChange();
+            fm_synth.SetParam(p.control_number, (float)p.value / 127.0f);
+        } break;
+        
         default: break;
     }
 }
 
-// Effect Processing Functions
-void GetReverbSample(float &outl, float &outr, float inl, float inr) {
-    fonepole(currentDelay, delayTarget, .00007f);
-    delr.SetDelay(currentDelay);
-    dell.SetDelay(currentDelay);
-    delr2.SetDelay(20000.0f);
-    dell2.SetDelay(30000.0f);
-    outl = dell.Read() + dell2.Read();
-    outr = delr.Read() + delr2.Read();
-    dell.Write((feedback * outl) + inl);
-    dell2.Write((feedback * outl) + inl);
-    delr.Write((feedback * outr) + inr);
-    delr2.Write((feedback * outr) + inr);
-
-    crs.Process(inl);
-    crs2.Process(inr);
-    crs3.Process(inl);
-    crs4.Process(inr);
-    
-    outl = crs.GetLeft() * drywet *2.0f  + crs3.GetLeft() * drywet*2.0f + inl * (0.5f - drywet) + (feedback * outl*drywet*0.6f) + ((1.0f - feedback) * inl*drywet);
-    outr = crs2.GetRight() * drywet*2.0f + crs4.GetRight() * drywet*2.0f + inr * (0.5f - drywet) + (feedback * outr*drywet*0.6f) + ((1.0f - feedback) * inr*drywet);
-}
-
-void GetDelaySample(float &outl, float &outr, float inl, float inr) {
-    fonepole(currentDelay, delayTarget, .00007f);
-    delr.SetDelay(currentDelay);
-    dell.SetDelay(currentDelay);
-    delr2.SetDelay(20000.0f);
-    dell2.SetDelay(30000.0f);
-    outl = dell.Read() + dell2.Read();
-    outr = delr.Read() + delr2.Read();
-
-    dell.Write((feedback * outl) + inl);
-    dell2.Write((feedback * outl) + inl);
-    outl = (feedback * outl) + ((1.0f - feedback) * inl);
-
-    delr.Write((feedback * outr) + inr);
-    delr2.Write((feedback * outr) + inr);
-    outr = (feedback * outr) + ((1.0f - feedback) * inr);
-}
-
-void GetChorusSample(float &outl, float &outr, float inl, float inr) {
-    crs.Process(inl);
-    crs2.Process(inr);
-    crs3.Process(inl);
-    crs4.Process(inr);
-    
-    outl = crs.GetLeft() * drywet *2.5f + crs3.GetLeft() * drywet*2.5f + inl * (0.5f - drywet);
-    outr = crs2.GetRight() * drywet*2.5f + crs4.GetRight() * drywet*2.5f + inr * (0.5f - drywet);
-}
-
-void GetPhaserSample(float &outl, float &outr, float inl, float inr) {
-    freq = 7000.0f;
-    fonepole(freq, freqtarget, .0001f);
-    psr.SetFreq(freq);
-    fonepole(lfo, lfotarget, .0001f);
-    psr.SetLfoDepth(lfo);
-    psr.SetFeedback(.2f);
-    psr2.SetFeedback(.3f);
-    psr.SetLfoFreq(30.0f);
-    psr2.SetLfoFreq(40.0f);
-
-    freq = 4000.0f;
-    fonepole(freq, freqtarget, .0001f);
-    psr2.SetFreq(freq);
-    fonepole(lfo, lfotarget, .0001f);
-    psr2.SetLfoDepth(lfo);
-    crs.Process(inl);
-
-    outl = crs.GetLeft() * drywet*0.5f + psr.Process(inl) * drywet + inl * (1.f - drywet);
-    outr = crs.GetRight() * drywet*0.3f + psr2.Process(inr) * drywet + inr * (1.f - drywet);
-}
-
-void GetOctaveSample(float &outl, float &outr, float inl, float inr) {
-    outl = crs.GetLeft() * drywet*0.2f + pst.Process(inl) * drywet + inl * (1.f - drywet);
-    outr = crs.GetRight() * drywet*0.2f + pst.Process(inr) * drywet + inr * (1.f - drywet);
-}
-
-void UpdateKnobs(float &k1, float &k2) {
-    k1 = hw.knob1.Process();
-    k2 = hw.knob2.Process();
-
-    switch(mode) {
-        case CHRDEL:
-                for(auto& v : voices_left) {
-        v.SetShape(1);
-    }
-    for(auto& v : voices_right) {
-        v.SetShape(1);
-    }
-            drywet = k1;
-            delayTarget = hw.knob1.Process() * MAX_DELAY;
-            feedback = k1*0.2f; 
-            crs.SetLfoDepth(4.0f + k1*1.1f);
-            crs2.SetLfoDepth(5.0f + k1*1.2f);
-            crs3.SetLfoDepth(6.0f + k1*0.9f);
-            crs4.SetLfoDepth(7.0f + k1*0.8f);
-            crs.SetLfoFreq(k2*0.6f);
-            crs2.SetLfoFreq(k2*0.7f);
-            crs3.SetLfoFreq(k2*0.8f); 
-            crs4.SetLfoFreq(k2*0.9f); 
-            break;
-        case DEL:
-            delayTarget = hw.knob1.Process() * MAX_DELAY;
-            feedback = k2;
-            break;
-        case COR:
-            drywet = k1;
-            crs.SetLfoDepth(4.0f + k1*1.1f);
-            crs2.SetLfoDepth(5.0f + k1*1.2f);
-            crs3.SetLfoDepth(6.0f + k1*0.9f);
-            crs4.SetLfoDepth(7.0f + k1*0.8f);
-            crs.SetLfoFreq(k2*0.6f);
-            crs2.SetLfoFreq(k2*0.7f);
-            crs3.SetLfoFreq(k2*0.8f); 
-            crs4.SetLfoFreq(k2*0.9f); 
-            break;
-        case PHR:
-
-        for(auto& v : voices_left) {
-        v.SetShape(1);
-    }
-    for(auto& v : voices_right) {
-        v.SetShape(2);
-    }
-            drywet = k1;
-            delayTarget = hw.knob1.Process() * MAX_DELAY;
-            feedback = k1*0.2f ; 
-            crs.SetLfoDepth(4.0f + k1*1.1f);
-            crs2.SetLfoDepth(5.0f + k1*1.2f);
-            crs3.SetLfoDepth(6.0f + k1*0.9f);
-            crs4.SetLfoDepth(7.0f + k1*0.8f);
-            crs.SetLfoFreq(k2*0.6f);
-            crs2.SetLfoFreq(k2*0.7f);
-            crs3.SetLfoFreq(k2*0.8f); 
-            crs4.SetLfoFreq(k2*0.9f); 
-
-            break;
-        case OCT:
-                // Initialize synth voices
-    for(auto& v : voices_left) {
-        v.SetShape(1);
-    }
-    for(auto& v : voices_right) {
-        v.SetShape(2);
-    }
-            drywet = k1;
-            delayTarget = hw.knob1.Process() * MAX_DELAY;
-            feedback = k1*0.2f ; 
-            crs.SetLfoDepth(4.0f + k1*1.1f);
-            crs2.SetLfoDepth(5.0f + k1*1.2f);
-            crs3.SetLfoDepth(6.0f + k1*0.9f);
-            crs4.SetLfoDepth(7.0f + k1*0.8f);
-            crs.SetLfoFreq(k2*0.6f);
-            crs2.SetLfoFreq(k2*0.7f);
-            crs3.SetLfoFreq(k2*0.8f); 
-            crs4.SetLfoFreq(k2*0.9f); 
-            break;
-    }
-}
-
-void UpdateEncoder() {
-    mode = mode + hw.encoder.Increment();
-    mode = (mode % 5 + 5) % 5;
-}
-
-void UpdateLeds(float k1, float k2) {
-    hw.led1.Set(
-        k1 * (mode == 2), k1 * (mode == 1), k1 * (mode == 0 || mode == 3));
-    hw.led2.Set(
-        k2 * (mode == 3), k2 * (mode == 2 || mode == 4), k2 * (mode == 0 || mode == 4));
-
-    hw.UpdateLeds();
-}
-
-void Controls() {
-    float k1, k2;
-    delayTarget = feedback = drywet = 0;
-
-    hw.ProcessAnalogControls();
-    hw.ProcessDigitalControls();
-
-    UpdateKnobs(k1, k2);
-    UpdateEncoder();
-    UpdateLeds(k1, k2);
-}
-
-void AudioCallback(AudioHandle::InterleavingInputBuffer in,
-                   AudioHandle::InterleavingOutputBuffer out,
-                   size_t size) {
-    Controls();
-    // First process synth voices
-    for(size_t i = 0; i < size; i += 2) {
-        float synth_left = 0.0f;
-        float synth_right = 0.0f;
-
-        for(auto& v : voices_left) {
-            synth_left += v.Process();
-        }
-        for(auto& v : voices_right) {
-            synth_right += v.Process();
-        }
-
-        synth_left /= static_cast<float>(kVoicesPerSide);
-        synth_right /= static_cast<float>(kVoicesPerSide);
-
-        // Then process effects
-        float outl, outr;
-        switch(mode) {
-            case CHRDEL: GetReverbSample(outl, outr, synth_left, synth_right); break;
-            case DEL: GetDelaySample(outl, outr, synth_left, synth_right); break;
-            case COR: GetChorusSample(outl, outr, synth_left, synth_right); break;
-            case PHR: GetReverbSample(outl, outr, synth_left, synth_right); break;
-            case OCT: GetReverbSample(outl, outr, synth_left, synth_right); break;
-            default: outl = outr = 0;
-        }
-
-    
-        out[i] = 1.5*outl;
-        out[i + 1] = 1.5*outr;
-    }
-}
-
-int main(void) {
-    // Initialize hardware
+int main(void)
+{
+    float samplerate;
     hw.Init();
-    hw.SetAudioBlockSize(512);
-    float samplerate = hw.AudioSampleRate();
+    hw.SetAudioBlockSize(4);
+    hw.seed.usb_handle.Init(UsbHandle::FS_INTERNAL);
+    System::Delay(250);
 
-    // Initialize LFOs
-    lfoLeft.Init(samplerate);
-    lfoRight.Init(samplerate);
-    lfoLeft.SetWaveform(Oscillator::WAVE_SIN);
-    lfoRight.SetWaveform(Oscillator::WAVE_SIN);
-    lfoLeft.SetFreq(lfoLeftRate);
-    lfoRight.SetFreq(lfoRightRate);
-    lfoLeft.SetAmp(1.0f);
-    lfoRight.SetAmp(1.0f);
+    samplerate = hw.AudioSampleRate();
+    fm_synth.Init(samplerate);
 
-    // Initialize synth voices
-    for(auto& v : voices_left) {
-        v.Init(samplerate);
-        v.SetFilter(globalCutoffLeft, globalResonance);
-    }
-    for(auto& v : voices_right) {
-        v.Init(samplerate);
-        v.SetFilter(globalCutoffRight, globalResonance);
-    }
-
-    // Initialize effects
-    dell.Init();
-    delr.Init();
-    dell2.Init();
-    delr2.Init();
-    crs.Init(samplerate);
-    crs2.Init(samplerate);
-    crs3.Init(samplerate);
-    crs4.Init(samplerate);
-    psr.Init(samplerate);
-    psr2.Init(samplerate);
-    pst.Init(samplerate);
-
-    // Set initial effect parameters
-    currentDelay = delayTarget = samplerate * 0.75f;
-    dell.SetDelay(currentDelay);
-    delr.SetDelay(currentDelay);
-    dell2.SetDelay(currentDelay+500);
-    delr2.SetDelay(currentDelay+1000);
-
-    crs.SetFeedback(.1f);
-    crs.SetDelay(.7f);
-    crs2.SetFeedback(.1f);
-    crs2.SetDelay(.82f);
-    crs3.SetFeedback(.1f);
-    crs3.SetDelay(.9f);
-    crs4.SetFeedback(.1f);
-    crs4.SetDelay(.97f);
-
-    numstages = 4;
-    psr.SetPoles(numstages);
-    psr2.SetPoles(numstages);
-    freqtarget = freq = 0.f;
-    lfotarget = lfo = 0.f;
-
-    pst.SetTransposition(12.0f);
-    octDelSize = 256;
-    pst.SetDelSize(octDelSize);
-
-    // Start audio
     hw.StartAdc();
     hw.StartAudio(AudioCallback);
     hw.midi.StartReceive();
-
-    while(true) {
+    
+    for(;;) {
         hw.midi.Listen();
         while(hw.midi.HasEvents()) {
             HandleMidiMessage(hw.midi.PopEvent());
         }
-        
-        // Update LFO rates based on some control (you can map these to knobs or MIDI CCs)
-        // For now they're fixed at their default values
-        lfoLeft.SetFreq(lfoLeftRate);
-        lfoRight.SetFreq(lfoRightRate);
     }
 }
