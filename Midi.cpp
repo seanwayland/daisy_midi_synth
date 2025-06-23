@@ -1,15 +1,42 @@
 #include "daisy_pod.h"
 #include "daisysp.h"
-#include <stdio.h>
-#include <string.h>
+#include <vector>
 
 using namespace daisy;
 using namespace daisysp;
 
+// Effects Constants
+#define MAX_DELAY static_cast<size_t>(48000 * 2.5f)
+#define CHRDEL 0
+#define DEL 1
+#define COR 2
+#define PHR 3
+#define OCT 4
+#define FM 5
+
+// FM Synth Constants
+const int kNumVoices = 8;
+const float kMaxOutputLevel = 0.7f; // Safe output level to prevent clipping
+
 DaisyPod hw;
 
-const int kNumVoices = 8;
+// Effects Objects
+static Chorus crs, crs2, crs3, crs4;
+static PitchShifter pst;
+static Phaser psr, psr2;
+static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS dell;
+static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delr;
+static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS dell2;
+static DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delr2;
 
+// Global Variables
+int mode = FM;
+int numstages;
+uint32_t octDelSize;
+float currentDelay, feedback, delayTarget, freq, freqtarget, lfotarget, lfo;
+float drywet;
+
+// FM Synth Implementation
 struct FmVoice {
     Oscillator carrierL, carrierR;
     Oscillator modulatorL, modulatorR;
@@ -26,7 +53,6 @@ struct FmVoice {
     float velocity_amount;
     
     float prev_mod_signalL, prev_mod_signalR;
-    float prev_carrier_signalL, prev_carrier_signalR;
     
     void Init(float sample_rate) {
         carrierL.Init(sample_rate);
@@ -43,7 +69,7 @@ struct FmVoice {
         carrier_freq = 440.0f;
         current_freq = 440.0f;
         pitch_bend = 0.0f;
-        feedback = 0.0f;
+        feedback = 0.3f;
         mod_index = 1.0f;
         base_mod_index = 1.0f;
         ratio = 1.0f;
@@ -51,12 +77,17 @@ struct FmVoice {
         note_number = -1;
         velocity_amount = 1.0f;
         prev_mod_signalL = prev_mod_signalR = 0.0f;
-        prev_carrier_signalL = prev_carrier_signalR = 0.0f;
         
         env.SetAttackTime(0.03f);
         env.SetDecayTime(0.3f);
         env.SetReleaseTime(0.03f);
         env.SetSustainLevel(0.7f);
+        
+        // Set safe amplitude limits
+        carrierL.SetAmp(0.5f);
+        carrierR.SetAmp(0.5f);
+        modulatorL.SetAmp(0.5f);
+        modulatorR.SetAmp(0.5f);
     }
     
     void UpdateFrequencies() {
@@ -75,36 +106,35 @@ struct FmVoice {
         }
         
         float note_pos = (float)(note_number - 36) / 60.0f;
-        note_pos = fminf(fmaxf(note_pos, 0.0f), 1.0f);
-        float feedback_scaling = 1.0f - note_pos * 0.3f;
-        float mod_scaling = note_pos * 0.5f + 0.5f;
+        note_pos = fclamp(note_pos, 0.0f, 1.0f);
+        float feedback_scaling = 1.0f - note_pos * 0.2f;
+        float mod_scaling = note_pos * 0.2f + 0.5f;
         
+        // More gentle modulation with velocity
         float effective_mod_index = base_mod_index * 
-                                  (0.5f + velocity_amount * 0.5f) *
+                                  (0.3f + velocity_amount * 0.4f) * // Reduced modulation range
                                   mod_scaling;
         
-        // Left channel (more intense)
+        // Left channel
         modulatorL.SetFreq(current_freq * ratio);
-        float mod_signalL = modulatorL.Process() + (prev_mod_signalL * feedback * feedback_scaling * 1.3f);
-        float phase_modL = mod_signalL * effective_mod_index * 0.75f * 0.1f;
+        float mod_signalL = modulatorL.Process() + (prev_mod_signalL * feedback * feedback_scaling * 0.9f); // Reduced feedback
+        float phase_modL = mod_signalL * effective_mod_index * 0.15f; // Reduced modulation depth
         carrierL.PhaseAdd(phase_modL);
         float carrier_signalL = carrierL.Process();
         
-        // Right channel (less intense)
+        // Right channel
         modulatorR.SetFreq(current_freq * ratio);
-        float mod_signalR = modulatorR.Process() + (prev_mod_signalR * feedback * feedback_scaling * 0.75f);
-        float phase_modR = mod_signalR * effective_mod_index * 1.2f * 0.1f;
+        float mod_signalR = modulatorR.Process() + (prev_mod_signalR * feedback * feedback_scaling * 0.9f); // Reduced feedback
+        float phase_modR = mod_signalR * effective_mod_index * 0.16f; // Reduced modulation depth
         carrierR.PhaseAdd(phase_modR);
         float carrier_signalR = carrierR.Process();
         
         float env_val = env.Process(gate);
-        *out_left = carrier_signalL * env_val * velocity_amount;
-        *out_right = carrier_signalR * env_val * velocity_amount;
+        *out_left = carrier_signalL * env_val * velocity_amount * 0.8f; // Reduced output level
+        *out_right = carrier_signalR * env_val * velocity_amount * 0.8f; // Reduced output level
         
-        prev_mod_signalL = mod_signalL;
-        prev_mod_signalR = mod_signalR;
-        prev_carrier_signalL = carrier_signalL;
-        prev_carrier_signalR = carrier_signalR;
+        prev_mod_signalL = mod_signalL * 0.5f; // Dampen feedback signal
+        prev_mod_signalR = mod_signalR * 0.5f; // Dampen feedback signal
     }
     
     void SetFreq(float freq) {
@@ -118,14 +148,15 @@ struct FmVoice {
     }
     
     void SetAmp(float amp) {
-        carrierL.SetAmp(amp);
-        carrierR.SetAmp(amp);
+        // Safe amplitude limits
+        carrierL.SetAmp(fclamp(amp, 0.1f, 0.6f));
+        carrierR.SetAmp(fclamp(amp, 0.1f, 0.6f));
     }
     
     void Trigger(float freq, float velocity, int note) {
         SetFreq(freq);
-        velocity_amount = velocity;
-        SetAmp(velocity * 0.8f);
+        velocity_amount = fclamp(velocity, 0.1f, 1.0f); // Clamp velocity
+        SetAmp(velocity_amount * 0.6f); // Reduced max amplitude
         note_number = note;
         gate = true;
     }
@@ -165,8 +196,8 @@ struct FmSynth {
                 mixL += voiceL * (1.0f / kNumVoices);
                 mixR += voiceR * (1.0f / kNumVoices);
             }
-            out_left[i] = out_left[i+1] = mixL;
-            out_right[i] = out_right[i+1] = mixR;
+            out_left[i] = fclamp(mixL, -kMaxOutputLevel, kMaxOutputLevel);
+            out_right[i] = fclamp(mixR, -kMaxOutputLevel, kMaxOutputLevel);
         }
     }
     
@@ -181,10 +212,10 @@ struct FmSynth {
         
         if (voice_idx == -1) voice_idx = 0;
         
-        float normalized_velocity = velocity / 127.0f;
+        float normalized_velocity = fclamp(velocity / 127.0f, 0.1f, 1.0f);
         voices[voice_idx].Trigger(mtof(note), normalized_velocity, note);
-        voices[voice_idx].feedback = feedback*normalized_velocity*8.0;
-        voices[voice_idx].base_mod_index = mod_index*normalized_velocity*2.05;
+        voices[voice_idx].feedback = feedback * normalized_velocity * 9.0f; // Reduced feedback scaling
+        voices[voice_idx].base_mod_index = mod_index * normalized_velocity * 0.6f; // Reduced modulation
         voices[voice_idx].ratio = ratio;
         voices[voice_idx].SetPitchBend(pitch_bend);
     }
@@ -207,23 +238,22 @@ struct FmSynth {
     }
     
     void SetParam(int cc, float value) {
+        value = fclamp(value, 0.0f, 1.0f); // Clamp all parameter values
+        
         switch(cc) {
             case 1:
-                mod_index = value * 2.0f;
+                mod_index = value * 1.5f; // Reduced max modulation
+                feedback = value * 0.8f; // Reduced max feedback
                 for (int i = 0; i < kNumVoices; i++) {
                     if (voices[i].IsActive()) {
-                        voices[i].base_mod_index = mod_index;
-                    }
-                }
-                feedback = value;
-                for (int i = 0; i < kNumVoices; i++) {
-                    if (voices[i].IsActive()) {
-                        voices[i].feedback = feedback;
+                        voices[i].base_mod_index = mod_index * 0.5f;
+                        voices[i].feedback = feedback * 0.5f;
                     }
                 }
                 break;
+
             case 2:
-                feedback = value;
+                feedback = value * 0.8f; // Reduced max feedback
                 for (int i = 0; i < kNumVoices; i++) {
                     if (voices[i].IsActive()) {
                         voices[i].feedback = feedback;
@@ -231,7 +261,7 @@ struct FmSynth {
                 }
                 break;
             case 3:
-                ratio = 0.25f + value * 3.75f;
+                ratio = 0.5f + value * 2.5f; // Reduced ratio range
                 for (int i = 0; i < kNumVoices; i++) {
                     if (voices[i].IsActive()) {
                         voices[i].ratio = ratio;
@@ -241,10 +271,10 @@ struct FmSynth {
                 break;
             case 4: case 5: case 6: case 7:
                 for (int i = 0; i < kNumVoices; i++) {
-                    if (cc == 4) voices[i].env.SetAttackTime(value * 2.0f);
-                    if (cc == 5) voices[i].env.SetDecayTime(value * 2.0f);
+                    if (cc == 4) voices[i].env.SetAttackTime(value * 1.5f); // Reduced max time
+                    if (cc == 5) voices[i].env.SetDecayTime(value * 1.5f); // Reduced max time
                     if (cc == 6) voices[i].env.SetSustainLevel(value);
-                    if (cc == 7) voices[i].env.SetReleaseTime(value * 2.0f);
+                    if (cc == 7) voices[i].env.SetReleaseTime(value * 1.5f); // Reduced max time
                 }
                 break;
         }
@@ -253,64 +283,314 @@ struct FmSynth {
 
 FmSynth fm_synth;
 
-void AudioCallback(AudioHandle::InterleavingInputBuffer in,
-                   AudioHandle::InterleavingOutputBuffer out,
-                   size_t size)
-{
-    float out_left[size], out_right[size];
-    fm_synth.Process(out_left, out_right, size);
+// Effect Processing Functions
+void GetReverbSample(float &outl, float &outr, float inl, float inr) {
+    fonepole(currentDelay, delayTarget, .00007f);
+    delr.SetDelay(currentDelay);
+    dell.SetDelay(currentDelay);
+    delr2.SetDelay(20000.0f);
+    dell2.SetDelay(30000.0f);
+    outl = dell.Read() + dell2.Read();
+    outr = delr.Read() + delr2.Read();
+    dell.Write((feedback * outl) + inl);
+    dell2.Write((feedback * outl) + inl);
+    delr.Write((feedback * outr) + inr);
+    delr2.Write((feedback * outr) + inr);
+
+    crs.Process(inl);
+    crs2.Process(inr);
+    crs3.Process(inl);
+    crs4.Process(inr);
     
-    for(size_t i = 0; i < size; i += 2) {
-        out[i] = out_left[i];
-        out[i+1] = out_right[i];
+    outl = crs.GetLeft() * drywet * 2.0f  + crs3.GetLeft() * drywet * 2.0f + inl * (0.5f - drywet) + (feedback * outl * drywet * 0.6f) + ((1.0f - feedback) * inl * drywet);
+    outr = crs2.GetRight() * drywet * 2.0f + crs4.GetRight() * drywet * 2.0f + inr * (0.5f - drywet) + (feedback * outr * drywet * 0.6f) + ((1.0f - feedback) * inr * drywet);
+}
+
+void GetDelaySample(float &outl, float &outr, float inl, float inr) {
+    fonepole(currentDelay, delayTarget, .00007f);
+    delr.SetDelay(currentDelay);
+    dell.SetDelay(currentDelay);
+    delr2.SetDelay(20000.0f);
+    dell2.SetDelay(30000.0f);
+    outl = dell.Read() + dell2.Read();
+    outr = delr.Read() + delr2.Read();
+
+    dell.Write((feedback * outl) + inl);
+    dell2.Write((feedback * outl) + inl);
+    outl = (feedback * outl) + ((1.0f - feedback) * inl);
+
+    delr.Write((feedback * outr) + inr);
+    delr2.Write((feedback * outr) + inr);
+    outr = (feedback * outr) + ((1.0f - feedback) * inr);
+}
+
+void GetChorusSample(float &outl, float &outr, float inl, float inr) {
+    crs.Process(inl);
+    crs2.Process(inr);
+    crs3.Process(inl);
+    crs4.Process(inr);
+    
+    outl = crs.GetLeft() * drywet * 2.5f + crs3.GetLeft() * drywet * 2.5f + inl * (0.5f - drywet);
+    outr = crs2.GetRight() * drywet * 2.5f + crs4.GetRight() * drywet * 2.5f + inr * (0.5f - drywet);
+}
+
+void GetPhaserSample(float &outl, float &outr, float inl, float inr) {
+    freq = 7000.0f;
+    fonepole(freq, freqtarget, .0001f);
+    psr.SetFreq(freq);
+    fonepole(lfo, lfotarget, .0001f);
+    psr.SetLfoDepth(lfo);
+    psr.SetFeedback(.2f);
+    psr2.SetFeedback(.3f);
+    psr.SetLfoFreq(30.0f);
+    psr2.SetLfoFreq(40.0f);
+
+    freq = 4000.0f;
+    fonepole(freq, freqtarget, .0001f);
+    psr2.SetFreq(freq);
+    fonepole(lfo, lfotarget, .0001f);
+    psr2.SetLfoDepth(lfo);
+    crs.Process(inl);
+
+    outl = crs.GetLeft() * drywet * 0.5f + psr.Process(inl) * drywet + inl * (1.f - drywet);
+    outr = crs.GetRight() * drywet * 0.3f + psr2.Process(inr) * drywet + inr * (1.f - drywet);
+}
+
+void GetOctaveSample(float &outl, float &outr, float inl, float inr) {
+    outl = crs.GetLeft() * drywet * 0.2f + pst.Process(inl) * drywet + inl * (1.f - drywet);
+    outr = crs.GetRight() * drywet * 0.2f + pst.Process(inr) * drywet + inr * (1.f - drywet);
+}
+
+void GetFmSample(float &outl, float &outr, float inl, float inr) {
+    // Process FM synth
+    float fm_left, fm_right;
+    fm_synth.Process(&fm_left, &fm_right, 1);
+    
+    // Apply delay effect
+    fonepole(currentDelay, delayTarget, .00007f);
+    delr.SetDelay(currentDelay);
+    dell.SetDelay(currentDelay);
+    delr2.SetDelay(20000.0f);
+    dell2.SetDelay(30000.0f);
+    
+    outl = dell.Read();
+    outr = delr.Read();
+    
+    dell.Write((feedback * outl) + fm_left);
+    dell2.Write((feedback * outl) + fm_left);
+    outl = (feedback * outl) + ((1.0f - feedback) * fm_left);
+
+    delr.Write((feedback * outr) + fm_right);
+    delr2.Write((feedback * outr) + fm_right);
+    outr = (feedback * outr) + ((1.0f - feedback) * fm_right);
+}
+
+void UpdateKnobs(float &k1, float &k2) {
+    k1 = hw.knob1.Process();
+    k2 = hw.knob2.Process();
+
+    switch(mode) {
+        case CHRDEL:
+            drywet = k1;
+            delayTarget = hw.knob1.Process() * MAX_DELAY;
+            feedback = k1 * 0.2f; 
+            crs.SetLfoDepth(4.0f + k1 * 1.1f);
+            crs2.SetLfoDepth(5.0f + k1 * 1.2f);
+            crs3.SetLfoDepth(6.0f + k1 * 0.9f);
+            crs4.SetLfoDepth(7.0f + k1 * 0.8f);
+            crs.SetLfoFreq(k2 * 0.6f);
+            crs2.SetLfoFreq(k2 * 0.7f);
+            crs3.SetLfoFreq(k2 * 0.8f); 
+            crs4.SetLfoFreq(k2 * 0.9f); 
+            break;
+        case DEL:
+            delayTarget = hw.knob1.Process() * MAX_DELAY;
+            feedback = k2 * 0.8f; // Reduced max feedback
+            break;
+        case COR:
+            drywet = k1;
+            crs.SetLfoDepth(4.0f + k1 * 1.1f);
+            crs2.SetLfoDepth(5.0f + k1 * 1.2f);
+            crs3.SetLfoDepth(6.0f + k1 * 0.9f);
+            crs4.SetLfoDepth(7.0f + k1 * 0.8f);
+            crs.SetLfoFreq(k2 * 0.6f);
+            crs2.SetLfoFreq(k2 * 0.7f);
+            crs3.SetLfoFreq(k2 * 0.8f); 
+            crs4.SetLfoFreq(k2 * 0.9f); 
+            break;
+        case PHR:
+            drywet = k1;
+            delayTarget = hw.knob1.Process() * MAX_DELAY;
+            feedback = k1 * 0.2f; 
+            crs.SetLfoDepth(4.0f + k1 * 1.1f);
+            crs2.SetLfoDepth(5.0f + k1 * 1.2f);
+            crs3.SetLfoDepth(6.0f + k1 * 0.9f);
+            crs4.SetLfoDepth(7.0f + k1 * 0.8f);
+            crs.SetLfoFreq(k2 * 0.6f);
+            crs2.SetLfoFreq(k2 * 0.7f);
+            crs3.SetLfoFreq(k2 * 0.8f); 
+            crs4.SetLfoFreq(k2 * 0.9f); 
+            break;
+        case OCT:
+            drywet = k1;
+            delayTarget = hw.knob1.Process() * MAX_DELAY;
+            feedback = k1 * 0.2f; 
+            crs.SetLfoDepth(4.0f + k1 * 1.1f);
+            crs2.SetLfoDepth(5.0f + k1 * 1.2f);
+            crs3.SetLfoDepth(6.0f + k1 * 0.9f);
+            crs4.SetLfoDepth(7.0f + k1 * 0.8f);
+            crs.SetLfoFreq(k2 * 0.6f);
+            crs2.SetLfoFreq(k2 * 0.7f);
+            crs3.SetLfoFreq(k2 * 0.8f); 
+            crs4.SetLfoFreq(k2 * 0.9f); 
+            break;
+        case FM:
+            delayTarget = hw.knob1.Process() * MAX_DELAY;
+            feedback = k2 * 0.8f; // Reduced max feedback
+            drywet = k1;
+            break;
     }
 }
 
-void HandleMidiMessage(MidiEvent m)
-{
+void UpdateEncoder() {
+    mode = mode + hw.encoder.Increment();
+    mode = (mode % 6 + 6) % 6;
+}
+
+void UpdateLeds(float k1, float k2) {
+    hw.led1.Set(
+        k1 * (mode == 2), k1 * (mode == 1), k1 * (mode == 0 || mode == 3 || mode == 5));
+    hw.led2.Set(
+        k2 * (mode == 3 || mode == 5), k2 * (mode == 2 || mode == 4), k2 * (mode == 0 || mode == 4));
+
+    hw.UpdateLeds();
+}
+
+void Controls() {
+    float k1, k2;
+    delayTarget = feedback = drywet = 0;
+
+    hw.ProcessAnalogControls();
+    hw.ProcessDigitalControls();
+
+    UpdateKnobs(k1, k2);
+    UpdateEncoder();
+    UpdateLeds(k1, k2);
+}
+
+void HandleMidiMessage(MidiEvent m) {
     switch(m.type) {
         case NoteOn: {
-            NoteOnEvent p = m.AsNoteOn();
-            if(m.data[1] != 0) fm_synth.NoteOn(p.note, p.velocity);
-            else fm_synth.NoteOff(p.note);
-        } break;
-        
+            auto p = m.AsNoteOn();
+            if(p.velocity != 0)
+                fm_synth.NoteOn(p.note, p.velocity);
+            else
+                fm_synth.NoteOff(p.note);
+            break;
+        }
         case NoteOff: {
-            NoteOffEvent p = m.AsNoteOff();
+            auto p = m.AsNoteOff();
             fm_synth.NoteOff(p.note);
-        } break;
-        
-        case PitchBend: {
-            PitchBendEvent p = m.AsPitchBend();
-            float bend = (float)(p.value / 8192.0f);
-            fm_synth.SetPitchBend(bend);
-        } break;
-        
+            break;
+        }
         case ControlChange: {
-            ControlChangeEvent p = m.AsControlChange();
-            fm_synth.SetParam(p.control_number, (float)p.value / 127.0f);
-        } break;
-        
+            auto p = m.AsControlChange();
+            fm_synth.SetParam(p.control_number, static_cast<float>(p.value) / 127.0f);
+            break;
+        }
+        case PitchBend: {
+            auto p = m.AsPitchBend();
+            float bendVal = static_cast<float>(p.value);
+            float norm = (bendVal / 8192.0f);
+            fm_synth.SetPitchBend(norm);
+            break;
+        }
         default: break;
     }
 }
 
-int main(void)
-{
-    float samplerate;
+void AudioCallback(AudioHandle::InterleavingInputBuffer in,
+                   AudioHandle::InterleavingOutputBuffer out,
+                   size_t size) {
+    Controls();
+    
+    for(size_t i = 0; i < size; i += 2) {
+        // Process FM synth
+        float fm_left, fm_right;
+        fm_synth.Process(&fm_left, &fm_right, 1);
+        
+        // Process effects
+        float outl, outr;
+        switch(mode) {
+            case CHRDEL: GetReverbSample(outl, outr, fm_left, fm_right); break;
+            case DEL: GetDelaySample(outl, outr, fm_left, fm_right); break;
+            case COR: GetChorusSample(outl, outr, fm_left, fm_right); break;
+            case PHR: GetPhaserSample(outl, outr, fm_left, fm_right); break;
+            case OCT: GetOctaveSample(outl, outr, fm_left, fm_right); break;
+            case FM: GetFmSample(outl, outr, fm_left, fm_right); break;
+            default: outl = outr = 0;
+        }
+        
+        // Safe output with clamping
+        out[i] = fclamp(outl * 1.2f, -0.9f, 0.9f);
+        out[i + 1] = fclamp(outr * 1.5f, -0.9f, 0.9f);
+    }
+}
+
+int main(void) {
+    // Initialize hardware
     hw.Init();
     hw.SetAudioBlockSize(4);
-    hw.seed.usb_handle.Init(UsbHandle::FS_INTERNAL);
-    System::Delay(250);
+    float samplerate = hw.AudioSampleRate();
 
-    samplerate = hw.AudioSampleRate();
+    // Initialize FM synth
     fm_synth.Init(samplerate);
 
+    // Initialize effects
+    dell.Init();
+    delr.Init();
+    dell2.Init();
+    delr2.Init();
+    crs.Init(samplerate);
+    crs2.Init(samplerate);
+    crs3.Init(samplerate);
+    crs4.Init(samplerate);
+    psr.Init(samplerate);
+    psr2.Init(samplerate);
+    pst.Init(samplerate);
+
+    // Set initial effect parameters
+    currentDelay = delayTarget = samplerate * 0.75f;
+    dell.SetDelay(currentDelay);
+    delr.SetDelay(currentDelay);
+    dell2.SetDelay(currentDelay + 500);
+    delr2.SetDelay(currentDelay + 1000);
+
+    crs.SetFeedback(.1f);
+    crs.SetDelay(.7f);
+    crs2.SetFeedback(.1f);
+    crs2.SetDelay(.82f);
+    crs3.SetFeedback(.1f);
+    crs3.SetDelay(.9f);
+    crs4.SetFeedback(.1f);
+    crs4.SetDelay(.97f);
+
+    numstages = 4;
+    psr.SetPoles(numstages);
+    psr2.SetPoles(numstages);
+    freqtarget = freq = 0.f;
+    lfotarget = lfo = 0.f;
+
+    pst.SetTransposition(12.0f);
+    octDelSize = 256;
+    pst.SetDelSize(octDelSize);
+
+    // Start audio
     hw.StartAdc();
     hw.StartAudio(AudioCallback);
     hw.midi.StartReceive();
-    
-    for(;;) {
+
+    while(true) {
         hw.midi.Listen();
         while(hw.midi.HasEvents()) {
             HandleMidiMessage(hw.midi.PopEvent());
