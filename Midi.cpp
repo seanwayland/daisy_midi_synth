@@ -53,7 +53,7 @@ struct FmVoice {
         prev_mod_signalL = prev_mod_signalR = 0.0f;
         prev_carrier_signalL = prev_carrier_signalR = 0.0f;
         
-        env.SetAttackTime(0.04f);
+        env.SetAttackTime(0.03f);
         env.SetDecayTime(0.3f);
         env.SetReleaseTime(0.03f);
         env.SetSustainLevel(0.7f);
@@ -76,7 +76,7 @@ struct FmVoice {
         
         float note_pos = (float)(note_number - 36) / 60.0f;
         note_pos = fminf(fmaxf(note_pos, 0.0f), 1.0f);
-        float feedback_scaling = 1.0f - note_pos * 0.7f;
+        float feedback_scaling = 1.0f - note_pos * 0.3f;
         float mod_scaling = note_pos * 0.5f + 0.5f;
         
         float effective_mod_index = base_mod_index * 
@@ -183,8 +183,8 @@ struct FmSynth {
         
         float normalized_velocity = velocity / 127.0f;
         voices[voice_idx].Trigger(mtof(note), normalized_velocity, note);
-        voices[voice_idx].feedback = feedback;
-        voices[voice_idx].base_mod_index = mod_index;
+        voices[voice_idx].feedback = feedback*normalized_velocity*8.0;
+        voices[voice_idx].base_mod_index = mod_index*normalized_velocity*2.05;
         voices[voice_idx].ratio = ratio;
         voices[voice_idx].SetPitchBend(pitch_bend);
     }
